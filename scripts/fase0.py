@@ -50,7 +50,7 @@ def tabla(filas: list[tuple], titulos: tuple[str, ...]) -> None:
 def validar(con) -> int:
     """Revisiones de la fase 0. Devuelve cuántos problemas encontró (los avisos informativos no cuentan)."""
     problemas = 0
-    capas = [r[0] for r in consulta(con, "select capa from meta.capas order by capa")]
+    capas = [r[0] for r in consulta(con, "select capa from meta.capas where capa not like 'archivo:%' order by capa")]
 
     log(f'validación 1: geometrías inválidas, vacías o nulas y sistema de coordenadas ({len(capas)} capas)')
     filas = []

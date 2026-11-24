@@ -34,6 +34,13 @@ create table if not exists terreno.hojas (
   geom           geometry(Polygon, 6369) not null   -- recuadro de la hoja
 );
 create index if not exists hojas_geom on terreno.hojas using gist (geom);
+-- control en terreno abierto (superficie − terreno < 1 m: sin árboles ni techos), donde el CEM y la hoja deberían
+-- coincidir salvo por sus errores; ahí se ve si una hoja está corrida respecto a sus vecinas
+alter table terreno.hojas add column if not exists pct_abierto real;           -- % de la hoja en terreno abierto
+alter table terreno.hojas add column if not exists sesgo_abierto_m real;       -- mediana de (hoja − CEM) en celdas abiertas
+alter table terreno.hojas add column if not exists nmad_abierto_m real;
+alter table terreno.hojas add column if not exists desfase_m real;             -- |sesgo_abierto − mediana de la zona|
+alter table terreno.hojas add column if not exists costura_abierto_m real;     -- costura medida solo en terreno abierto
 comment on table terreno.hojas is 'Hojas 1:10 000 de los modelos digitales de elevación de INEGI que tocan Hidalgo (catálogo de INEGI): la resolución más fina con terreno y superficie, la edición más reciente. Las de 1.5 m (ediciones 2025–2026) y 5 m (2015–2026) salen de fotogrametría de imágenes de satélite en estéreo (no LiDAR): bajo bosque denso el terreno es una estimación. Control de calidad contra el CEM 4.0 de 15 m: sesgo_m, nmad_m, p95_abs_m y costura_m';
 
 create table if not exists terreno.cobertura (

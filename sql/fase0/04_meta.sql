@@ -74,10 +74,12 @@ declare
 begin
   insert into meta.capas (capa)
   select f_table_schema || '.' || f_table_name from geometry_columns
-  where f_table_schema in ('base', 'qgis')
+  where f_table_schema in ('base', 'qgis', 'terreno')
   on conflict (capa) do nothing;
+  -- las capas de archivo (archivo:ruta, rásters de datos/) se quedan aunque no estén en geometry_columns
   delete from meta.capas c
-  where not exists (select 1 from geometry_columns g where g.f_table_schema || '.' || g.f_table_name = c.capa);
+  where c.capa not like 'archivo:%'
+    and not exists (select 1 from geometry_columns g where g.f_table_schema || '.' || g.f_table_name = c.capa);
   for r in
     select c.capa, g.type, g.srid from meta.capas c
     join geometry_columns g on g.f_table_schema || '.' || g.f_table_name = c.capa

@@ -80,12 +80,17 @@ def paso_cem() -> Path:
     return destino
 
 
-def cog(origen: Path, destino: Path, resampleo: str = 'AVERAGE') -> None:
-    """GeoTIFF optimizado (COG): teselas, DEFLATE con predictor de flotantes y vistas reducidas para QGIS."""
+def cog(origen: Path, destino: Path, resampleo: str = 'AVERAGE', error_max: float | None = None) -> None:
+    """GeoTIFF optimizado (COG) en EPSG:6369: teselas, vistas reducidas para QGIS y compresión sin pérdida (DEFLATE con
+    predictor), o LERC con un error máximo garantizado (error_max, en las unidades del dato) para lo que casi no se
+    comprime sin pérdida, como la pendiente. El sistema se asigna (no se reproyecta): las hojas de INEGI lo traen con
+    un nombre propio ("MEXICO_ITRF_2008_UTM_Zone_14N") que equivale a EPSG:6369."""
     gdal = gdal_()
-    gdal.Translate(str(destino), str(origen), format='COG',
-                   creationOptions=['COMPRESS=DEFLATE', 'PREDICTOR=YES', 'LEVEL=6', 'BLOCKSIZE=512',
-                                    f'OVERVIEW_RESAMPLING={resampleo}', 'NUM_THREADS=ALL_CPUS', 'BIGTIFF=IF_SAFER'])
+    compresion = (['COMPRESS=DEFLATE', 'PREDICTOR=YES', 'LEVEL=6'] if error_max is None
+                  else ['COMPRESS=LERC_ZSTD', f'MAX_Z_ERROR={error_max}'])
+    gdal.Translate(str(destino), str(origen), format='COG', outputSRS=f'EPSG:{SRID}',
+                   creationOptions=compresion + ['BLOCKSIZE=512', f'OVERVIEW_RESAMPLING={resampleo}',
+                                                 'NUM_THREADS=ALL_CPUS', 'BIGTIFF=IF_SAFER'])
 
 
 # ── Hojas 1:10 000 de INEGI (1.5 y 5 m) ─────────────────────────────────────────────────────────────────────────────
@@ -239,8 +244,51 @@ def extraer_raster(zip_: Path, destino: Path, url_ascii: str | None) -> None:
         gdal.Translate(str(destino), str(origen), format='GTiff', outputType=gdal.GDT_Float32,
                        outputSRS=None if srs else f'EPSG:{SRID}',
                        creationOptions=['TILED=YES', 'COMPRESS=DEFLATE', 'PREDICTOR=3', 'BIGTIFF=IF_SAFER'])
+        normalizar_nodata(destino)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+MINIMO_VALIDO = -1000.0   # m: nada en Hidalgo está por debajo; menos que esto (o no finito) es «sin dato»
+
+
+def normalizar_nodata(ruta: Path) -> bool:
+    """Deja el «sin dato» de una hoja en NODATA (-9999). INEGI no lo marca igual en todas: las de 1.5 m usan
+    -3.4028235e38 y algunas de 5 m declaran -3.4028231e38, que en flotante de 32 bits no es el mismo número y, al
+    interpolar, se cuela como altura. Devuelve True si cambió el archivo."""
+    import numpy as np
+    gdal = gdal_()
+    ds = gdal.Open(str(ruta))
+    b = ds.GetRasterBand(1)
+    if b.GetNoDataValue() == NODATA:
+        return False
+    a = b.ReadAsArray()
+    gt, srs = ds.GetGeoTransform(), ds.GetSpatialRef()
+    ds = None
+    a = np.where(np.isfinite(a) & (a > MINIMO_VALIDO), a, NODATA).astype(np.float32)
+    tmp = ruta.with_name(ruta.stem + '_n.tif')
+    out = gdal.GetDriverByName('GTiff').Create(str(tmp), a.shape[1], a.shape[0], 1, gdal.GDT_Float32,
+                                               ['TILED=YES', 'COMPRESS=DEFLATE', 'PREDICTOR=3'])
+    out.SetGeoTransform(gt)
+    out.SetSpatialRef(srs)
+    out.GetRasterBand(1).SetNoDataValue(NODATA)
+    out.GetRasterBand(1).WriteArray(a)
+    out = None
+    aux = ruta.with_name(ruta.name + '.aux.xml')
+    if aux.exists():
+        aux.unlink()
+    tmp.replace(ruta)
+    return True
+
+
+def paso_normalizar() -> None:
+    con = conectar()
+    n = 0
+    for (archivo,) in consulta(con, """select archivo_terreno from terreno.hojas where archivo_terreno is not null
+                                       union all
+                                       select archivo_superficie from terreno.hojas where archivo_superficie is not null"""):
+        n += normalizar_nodata(RAIZ / archivo)
+    log(f'«sin dato» normalizado a {NODATA:g} en {n} archivos')
 
 
 def descargar_simple(url: str, destino: Path) -> Path:
@@ -323,7 +371,9 @@ def vrt_fino(con, zona: str, tipo: str) -> Path:
     if not archivos:
         sys.exit(f'no hay hojas bajadas de {zona}: corre antes el paso hojas')
     vrt = TERRENO / f'{tipo}_{zona}_hojas.vrt'
-    nd = gdal.Open(str(archivos[-1])).GetRasterBand(1).GetNoDataValue()
+    ds = gdal.Open(str(archivos[-1]))   # el dataset debe vivir mientras se usa su banda
+    nd = ds.GetRasterBand(1).GetNoDataValue()
+    ds = None
     gdal.BuildVRT(str(vrt), [str(a) for a in archivos], xRes=FINO, yRes=FINO, resampleAlg='bilinear',
                   srcNodata=nd, VRTNodata=NODATA)
     return vrt
@@ -344,9 +394,129 @@ def rejilla_zona(con, zona: str, vrt: Path, margen: float = 1500) -> tuple[float
     return ax(xmin, math.floor), ay(ymin, math.floor), ax(xmax, math.ceil), ay(ymax, math.ceil)
 
 
+ANCHO_COSTURA_M = 60                 # rampa del peso de cada hoja desde su propia orilla
+PRIORIDAD = {1.5: 1.0, 5.0: 0.25}    # donde se enciman, la de 1.5 m pesa 4 veces más que la de 5 m
+BLOQUE = 500                         # filas por bloque (múltiplo de 10)
+
+
+def _crear(ruta: Path, w: int, h: int, gt: tuple, nodata: float | None = NODATA):
+    gdal = gdal_()
+    from osgeo import osr
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(SRID)
+    ds = gdal.GetDriverByName('GTiff').Create(str(ruta), w, h, 1, gdal.GDT_Float32,
+                                              ['TILED=YES', 'COMPRESS=DEFLATE', 'PREDICTOR=3', 'BIGTIFF=YES',
+                                               'NUM_THREADS=ALL_CPUS'])
+    ds.SetGeoTransform(gt)
+    ds.SetSpatialRef(srs)
+    if nodata is not None:
+        ds.GetRasterBand(1).SetNoDataValue(nodata)
+    return ds
+
+
+def _peso_hoja(archivo: Path, resolucion: float) -> Path:
+    """Peso de una hoja en su propia rejilla: 0 en la orilla de su dato y 1 a ANCHO_COSTURA_M hacia dentro, por su
+    prioridad. Así, donde dos hojas se enciman se mezclan en vez de que la última tape a la otra con un escalón."""
+    import numpy as np
+    from scipy import ndimage
+    gdal = gdal_()
+    destino = TERRENO / 'tmp' / f'peso_{archivo.stem}.tif'
+    if destino.exists():
+        return destino
+    destino.parent.mkdir(parents=True, exist_ok=True)
+    ds = gdal.Open(str(archivo))
+    nd = ds.GetRasterBand(1).GetNoDataValue()
+    a = ds.GetRasterBand(1).ReadAsArray()
+    valido = np.pad(np.isfinite(a) & (a > MINIMO_VALIDO), 1)       # el borde del arreglo también es orilla
+    dist = ndimage.distance_transform_edt(valido)[1:-1, 1:-1] * ds.GetGeoTransform()[1]
+    peso = (np.clip(dist / ANCHO_COSTURA_M, 0, 1) * PRIORIDAD[resolucion]).astype(np.float32)
+    out = _crear(destino, peso.shape[1], peso.shape[0], ds.GetGeoTransform(), None)
+    out.GetRasterBand(1).WriteArray(peso)
+    out = None
+    return destino
+
+
+def mezclar_hojas(con, zona: str, tipo: str, caja: tuple, destino: Path) -> Path:
+    """Mosaico de las hojas de la zona en la rejilla fina (caja), con las costuras mezcladas por peso."""
+    import math
+    import numpy as np
+    gdal = gdal_()
+    if destino.exists():
+        return destino
+    xmin, ymin, xmax, ymax = caja
+    w, h = round((xmax - xmin) / FINO), round((ymax - ymin) / FINO)
+    filas = consulta(con, f"""select archivo_{tipo}, resolucion_m from terreno.hojas
+                              where %s = any(zonas) and archivo_{tipo} is not null order by clave""", (zona,))
+    fuentes = []
+    for archivo, res in filas:
+        ruta = RAIZ / archivo
+        ds = gdal.Open(str(ruta))
+        gt, nd = ds.GetGeoTransform(), ds.GetRasterBand(1).GetNoDataValue()
+        sx0, sy1 = gt[0], gt[3]
+        sx1, sy0 = sx0 + gt[1] * ds.RasterXSize, sy1 + gt[5] * ds.RasterYSize
+        ds = None
+        bx0 = max(xmin, xmin + math.floor((sx0 - xmin) / FINO) * FINO)
+        bx1 = min(xmax, xmin + math.ceil((sx1 - xmin) / FINO) * FINO)
+        by1 = min(ymax, ymax - math.floor((ymax - sy1) / FINO) * FINO)
+        by0 = max(ymin, ymax - math.ceil((ymax - sy0) / FINO) * FINO)
+        if bx1 <= bx0 or by1 <= by0:
+            continue
+        alineada = abs((sx0 - xmin) / FINO - round((sx0 - xmin) / FINO)) < 1e-6 and gt[1] == FINO \
+            and abs((ymax - sy1) / FINO - round((ymax - sy1) / FINO)) < 1e-6
+        alg = 'near' if alineada else 'bilinear'
+        opc = dict(format='VRT', outputBounds=(bx0, by0, bx1, by1), xRes=FINO, yRes=FINO, resampleAlg=alg)
+        v = gdal.Warp('', str(ruta), srcNodata=nd, dstNodata=NODATA, **opc)
+        p = gdal.Warp('', str(_peso_hoja(ruta, res)), **opc)
+        fuentes.append({'v': v, 'p': p, 'c0': round((bx0 - xmin) / FINO), 'r0': round((ymax - by1) / FINO),
+                        'w': v.RasterXSize, 'h': v.RasterYSize})
+    out = _crear(destino, w, h, (xmin, FINO, 0, ymax, 0, -FINO))
+    ob = out.GetRasterBand(1)
+    for y in range(0, h, BLOQUE):
+        n = min(BLOQUE, h - y)
+        num = np.zeros((n, w), np.float64)
+        den = np.zeros((n, w), np.float64)
+        for s in fuentes:
+            ry0, ry1 = max(y, s['r0']), min(y + n, s['r0'] + s['h'])
+            if ry0 >= ry1:
+                continue
+            vals = s['v'].GetRasterBand(1).ReadAsArray(0, ry0 - s['r0'], s['w'], ry1 - ry0)
+            pes = s['p'].GetRasterBand(1).ReadAsArray(0, ry0 - s['r0'], s['w'], ry1 - ry0)
+            ok = np.isfinite(vals) & (vals > MINIMO_VALIDO)
+            pes = np.where(ok, pes, 0)
+            sl = (slice(ry0 - y, ry1 - y), slice(s['c0'], s['c0'] + s['w']))
+            num[sl] += pes * np.where(ok, vals, 0)
+            den[sl] += pes
+        ob.WriteArray(np.where(den > 0, num / np.maximum(den, 1e-12), NODATA).astype(np.float32), 0, y)
+    ob.FlushCache()
+    out = None
+    log(f'  mosaico de {tipo} ({len(fuentes)} hojas, costuras mezcladas en {ANCHO_COSTURA_M} m)')
+    return destino
+
+
+def _suavizar_extender(d, m, sigmas=(20, 60, 180)):
+    """Promedio local de d (donde m) que se extiende hacia afuera: primero a 300 m, luego a 900 m y a 2.7 km
+    (sigmas en celdas de 15 m); lo que quede, con la mediana."""
+    import numpy as np
+    from scipy import ndimage
+    corr = np.full(d.shape, np.nan, np.float32)
+    dm = np.where(m, d, 0).astype(np.float64)
+    mm = m.astype(np.float64)
+    for s in sigmas:
+        num = ndimage.gaussian_filter(dm, s, truncate=3)
+        den = ndimage.gaussian_filter(mm, s, truncate=3)
+        llenar = np.isnan(corr) & (den > 0.02)
+        corr[llenar] = (num[llenar] / den[llenar]).astype(np.float32)
+    corr[np.isnan(corr)] = float(np.median(d[m])) if m.any() else 0.0
+    return corr
+
+
 def fusionar(con, zona: str) -> Path:
-    """Relieve de la zona a 1.5 m: hojas de INEGI donde las hay y CEM 4.0 (interpolación cúbica) donde no, con una
-    transición lineal de TRANSICION_M metros hacia dentro de la hoja para que no quede un escalón."""
+    """Relieve de la zona a 1.5 m: hojas de INEGI (costuras mezcladas) donde las hay y CEM 4.0 donde no.
+
+    El CEM queda por encima del terreno de las hojas (≈ 4 m en terreno abierto y más bajo bosque y ciudad: sale de
+    radar y se comporta en parte como superficie). Antes de usarlo se le suma un ajuste local: la diferencia
+    hoja − CEM suavizada y extendida hacia donde no hay hoja (se guarda como ajuste_cem_<zona>_15m.tif). Luego, una
+    transición lineal de TRANSICION_M metros hacia dentro de la hoja, para que no quede escalón."""
     import numpy as np
     from scipy import ndimage
     gdal = gdal_()
@@ -357,35 +527,48 @@ def fusionar(con, zona: str) -> Path:
     cem = TERRENO / 'cem4_15m.tif'
     if not cem.exists():
         sys.exit('falta el CEM: corre antes el paso cem')
-    vrt = vrt_fino(con, zona, 'terreno')
-    xmin, ymin, xmax, ymax = rejilla_zona(con, zona, vrt)
+    caja = rejilla_zona(con, zona, vrt_fino(con, zona, 'terreno'))
+    xmin, ymin, xmax, ymax = caja
     w, h = round((xmax - xmin) / FINO), round((ymax - ymin) / FINO)
     log(f'relieve {zona}: {w:,} × {h:,} px a {FINO} m ({w * h / 1e6:,.0f} Mpx)')
-    fino = gdal.Translate('', str(vrt), format='VRT', projWin=(xmin, ymax, xmax, ymin), noData=NODATA)
-    base = gdal.Warp('', str(cem), format='VRT', outputBounds=(xmin, ymin, xmax, ymax), xRes=FINO, yRes=FINO,
+    mezcla = mezclar_hojas(con, zona, 'terreno', caja, TERRENO / 'tmp' / f'terreno_{zona}_mezcla.tif')
+    ds_f = gdal.Open(str(mezcla))
+    bf = ds_f.GetRasterBand(1)
+    base = gdal.Warp('', str(cem), format='VRT', outputBounds=caja, xRes=FINO, yRes=FINO,
                      resampleAlg='cubic', srcNodata=NODATA, dstNodata=NODATA)
-    bf, bb = fino.GetRasterBand(1), base.GetRasterBand(1)
+    bb = base.GetRasterBand(1)
 
-    # 1) celdas de 15 m completamente cubiertas por el dato fino
-    BLOQUE = 500    # filas por bloque (múltiplo de 10)
+    # 1) celdas de 15 m completamente cubiertas por las hojas y su altura media
     lleno = np.zeros((h // 10, w // 10), dtype=bool)
+    fino15 = np.zeros((h // 10, w // 10), dtype=np.float32)
     for y in range(0, h, BLOQUE):
         n = min(BLOQUE, h - y)
-        v = bf.ReadAsArray(0, y, w, n) != NODATA
-        lleno[y // 10:(y + n) // 10] = v.reshape(n // 10, 10, w // 10, 10).all(axis=(1, 3))
+        f = bf.ReadAsArray(0, y, w, n).reshape(n // 10, 10, w // 10, 10)
+        lleno[y // 10:(y + n) // 10] = (f != NODATA).all(axis=(1, 3))
+        fino15[y // 10:(y + n) // 10] = f.mean(axis=(1, 3))
     # 2) peso del dato fino: 0 en la orilla de lo cubierto, 1 a TRANSICION_M hacia dentro
     dist = ndimage.distance_transform_edt(lleno) * (FINO * 10)
     peso15 = np.clip((dist - FINO * 10) / TRANSICION_M, 0, 1).astype(np.float32)
-    log(f'  dato fino en {100 * lleno.mean():.1f} % de la caja; transición de {TRANSICION_M} m')
+    # 3) ajuste local del CEM hacia el terreno de las hojas
+    cem15 = gdal.Warp('', str(cem), format='MEM', outputBounds=caja, xRes=FINO * 10, yRes=FINO * 10,
+                      resampleAlg='bilinear', srcNodata=NODATA, dstNodata=NODATA).ReadAsArray()
+    m = lleno & (cem15 != NODATA)
+    ajuste15 = _suavizar_extender(fino15 - cem15, m)
+    fuera = ~lleno & (cem15 != NODATA)
+    log(f'  dato fino en {100 * lleno.mean():.1f} % de la caja; ajuste del CEM donde no hay hoja: mediana '
+        f'{float(np.median(ajuste15[fuera])) if fuera.any() else 0:+.2f} m '
+        f'(de {float(ajuste15[fuera].min()) if fuera.any() else 0:+.1f} a {float(ajuste15[fuera].max()) if fuera.any() else 0:+.1f}); '
+        f'transición de {TRANSICION_M} m')
+    ruta_ajuste = TERRENO / f'ajuste_cem_{zona}_15m.tif'
+    a = _crear(TERRENO / 'tmp' / f'ajuste_cem_{zona}.tif', w // 10, h // 10, (xmin, FINO * 10, 0, ymax, 0, -FINO * 10))
+    a.GetRasterBand(1).WriteArray(np.where(cem15 != NODATA, ajuste15, NODATA).astype(np.float32))
+    a = None
+    cog(TERRENO / 'tmp' / f'ajuste_cem_{zona}.tif', ruta_ajuste)
 
-    tmp = destino.with_name(destino.stem + '_tmp.tif')
-    drv = gdal.GetDriverByName('GTiff')
-    out = drv.Create(str(tmp), w, h, 1, gdal.GDT_Float32,
-                     ['TILED=YES', 'COMPRESS=DEFLATE', 'PREDICTOR=3', 'BIGTIFF=YES', 'NUM_THREADS=ALL_CPUS'])
-    out.SetGeoTransform((xmin, FINO, 0, ymax, 0, -FINO))
-    out.SetSpatialRef(fino.GetSpatialRef())
+    # 4) mezcla final por bloques
+    tmp = TERRENO / 'tmp' / f'relieve_{zona}.tif'
+    out = _crear(tmp, w, h, (xmin, FINO, 0, ymax, 0, -FINO))
     ob = out.GetRasterBand(1)
-    ob.SetNoDataValue(NODATA)
     cols = (np.arange(w) + 0.5) / 10 - 0.5
     for y in range(0, h, BLOQUE):
         n = min(BLOQUE, h - y)
@@ -394,12 +577,14 @@ def fusionar(con, zona: str) -> Path:
         filas = (np.arange(y, y + n) + 0.5) / 10 - 0.5
         rr, cc = np.meshgrid(filas, cols, indexing='ij')
         p = ndimage.map_coordinates(peso15, [rr, cc], order=1, mode='nearest').astype(np.float32)
+        aj = ndimage.map_coordinates(ajuste15, [rr, cc], order=1, mode='nearest').astype(np.float32)
         p[f == NODATA] = 0
-        # sin CEM queda el dato fino (o nada); con CEM, la mezcla (p = 0 donde no hay dato fino: queda el CEM)
-        r = np.where(b == NODATA, f, p * f + (1 - p) * b)
+        # sin CEM queda el dato fino (o nada); con CEM, la mezcla (p = 0 donde no hay dato fino: queda el CEM ajustado)
+        r = np.where(b == NODATA, f, p * f + (1 - p) * (b + aj))
         ob.WriteArray(r.astype(np.float32), 0, y)
     ob.FlushCache()
     out = None
+    ds_f = None
     cog(tmp, destino)
     tmp.unlink()
     log(f'{destino.relative_to(RAIZ).as_posix()} listo')
@@ -409,16 +594,17 @@ def fusionar(con, zona: str) -> Path:
 def derivados(dem: Path, nombre: str) -> None:
     """Sombreado multidireccional y pendiente (grados) del relieve, como COG."""
     gdal = gdal_()
-    for proc, sufijo, opciones in (('hillshade', 'sombreado', {'multiDirectional': True}),
-                                   ('slope', 'pendiente', {'slopeFormat': 'degree'})):
+    # pendiente con LERC y error máximo de 0.01°: en flotantes casi no se comprime sin pérdida (1.2 GB a 15 m)
+    for proc, sufijo, opciones, error in (('hillshade', 'sombreado', {'multiDirectional': True}, None),
+                                          ('slope', 'pendiente', {'slopeFormat': 'degree'}, 0.01)):
         destino = TERRENO / f'{sufijo}_{nombre}.tif'
         if destino.exists():
             continue
         tmp = destino.with_name(destino.stem + '_tmp.tif')
         t0 = time.time()
         gdal.DEMProcessing(str(tmp), str(dem), proc, computeEdges=True, **opciones,
-                           creationOptions=['TILED=YES', 'COMPRESS=DEFLATE', 'BIGTIFF=IF_SAFER', 'NUM_THREADS=ALL_CPUS'])
-        cog(tmp, destino)
+                           creationOptions=['TILED=YES', 'COMPRESS=ZSTD', 'BIGTIFF=YES', 'NUM_THREADS=ALL_CPUS'])
+        cog(tmp, destino, error_max=error)
         tmp.unlink()
         log(f'{destino.relative_to(RAIZ).as_posix()} ({time.time() - t0:.0f} s)')
 
@@ -433,63 +619,105 @@ def paso_relieve() -> None:
     # la superficie (edificios y árboles) se deja lista en mosaico para la fase 3
     sup = TERRENO / f'superficie_{zona}_1p5m.tif'
     if not sup.exists():
-        vrt = vrt_fino(con, zona, 'superficie')
-        xmin, ymin, xmax, ymax = rejilla_zona(con, zona, vrt_fino(con, zona, 'terreno'))
-        tmp = sup.with_name(sup.stem + '.vrt')
-        gdal_().Translate(str(tmp), str(vrt), format='VRT', projWin=(xmin, ymax, xmax, ymin), noData=NODATA)
+        caja = rejilla_zona(con, zona, vrt_fino(con, zona, 'terreno'))
+        tmp = mezclar_hojas(con, zona, 'superficie', caja, TERRENO / 'tmp' / f'superficie_{zona}_mezcla.tif')
         cog(tmp, sup)
-        tmp.unlink()
         log(f'{sup.relative_to(RAIZ).as_posix()} listo')
+    # los temporales (pesos de las hojas y mosaicos intermedios) se pueden borrar
+    import shutil
+    shutil.rmtree(TERRENO / 'tmp', ignore_errors=True)
 
 
 # ── Control de calidad de las hojas ─────────────────────────────────────────────────────────────────────────────────
 
-# Umbrales para marcar una hoja como «revisar». El CEM 4.0 no es independiente (integra datos de 5 m de INEGI) ni
-# más exacto (15 m): sirve para encontrar hojas desplazadas o con fallas gruesas, no para medir la exactitud fina.
-UMBRAL = {'sesgo_m': 2.0, 'nmad_m': 4.0, 'p95_abs_m': 15.0, 'costura_m': 0.5, 'sin_dato_pct': 5.0}
+# Criterios para marcar una hoja como «revisar». El CEM 4.0 no sirve de referencia absoluta: sale del radar de ALOS
+# y se comporta en parte como modelo de superficie (queda arriba del terreno, más bajo bosque y ciudad). Por eso se
+# compara en terreno abierto (superficie − terreno < 1 m) y lo que se busca es una hoja distinta de sus vecinas.
+# (El NMAD contra el CEM no es criterio: en terreno quebrado crece por comparar 15 m con 1.5 m, no por la hoja.)
+UMBRAL = {'desfase_m': 1.5,          # su sesgo en terreno abierto se aparta de la mediana de la zona
+          'costura_abierto_m': 0.5,  # diferencia con una hoja vecina donde se enciman, en terreno abierto
+          'sin_dato_pct': 5.0}
+ABIERTO_M = 1.0   # superficie − terreno por debajo de esto = suelo descubierto (sin árboles ni techos)
+
+
+def _mem(arr, gt, srs, nodata=None):
+    """Dataset en memoria para pasar un arreglo de numpy a gdal.Warp."""
+    gdal = gdal_()
+    ds = gdal.GetDriverByName('MEM').Create('', arr.shape[1], arr.shape[0], 1, gdal.GDT_Float32)
+    ds.SetGeoTransform(gt)
+    ds.SetSpatialRef(srs)
+    b = ds.GetRasterBand(1)
+    if nodata is not None:
+        b.SetNoDataValue(nodata)
+    b.WriteArray(arr)
+    return ds
+
+
+def _estadisticas(d):
+    import numpy as np
+    if d.size == 0:
+        return None, None, None
+    med = float(np.median(d))
+    return med, float(1.4826 * np.median(np.abs(d - med))), float(np.percentile(np.abs(d), 95))
 
 
 def paso_calidad() -> None:
+    import math
     import numpy as np
     gdal = gdal_()
     zona = zona_arg()
     con = conectar()
+    correr_sql_fase1(con)
     cem = TERRENO / 'cem4_15m.tif'
-    hojas = consulta(con, """select clave, archivo_terreno from terreno.hojas
+    hojas = consulta(con, """select clave, archivo_terreno, archivo_superficie from terreno.hojas
                              where %s = any(zonas) and archivo_terreno is not null order by clave""", (zona,))
-    gt_cem = gdal.Open(str(cem)).GetGeoTransform()
+    ds_cem = gdal.Open(str(cem))
+    gt_cem = ds_cem.GetGeoTransform()
+    ds_cem = None
     resultados = {}
-    for clave, archivo in hojas:
+    for clave, archivo, archivo_sup in hojas:
         ds = gdal.Open(str(RAIZ / archivo))
-        b = ds.GetRasterBand(1)
-        nd = b.GetNoDataValue()
-        a = b.ReadAsArray()
-        sin_dato = 100 * float(np.mean(a == nd)) if nd is not None else 0.0
-        gt = ds.GetGeoTransform()
+        nd = ds.GetRasterBand(1).GetNoDataValue()
+        t = ds.GetRasterBand(1).ReadAsArray()
+        gt, srs = ds.GetGeoTransform(), ds.GetSpatialRef()
+        dss = gdal.Open(str(RAIZ / archivo_sup))
+        nds = dss.GetRasterBand(1).GetNoDataValue()
+        s = dss.GetRasterBand(1).ReadAsArray()
+        dss = None
+        valido = np.isfinite(t) & (t > MINIMO_VALIDO)
+        abierto = valido & np.isfinite(s) & (s > MINIMO_VALIDO) & ((s - t) < ABIERTO_M)
+        sin_dato = 100 * float(1 - valido.mean())
+        pct_abierto = 100 * float(abierto.sum() / max(1, valido.sum()))
         x0, y1 = gt[0], gt[3]
         x1, y0 = x0 + gt[1] * ds.RasterXSize, y1 + gt[5] * ds.RasterYSize
         # caja alineada a la rejilla del CEM, hacia dentro de la hoja
         ax = lambda v, f: gt_cem[0] + f((v - gt_cem[0]) / 15) * 15
         ay = lambda v, f: gt_cem[3] + f((v - gt_cem[3]) / 15) * 15
-        import math
         caja = (ax(x0, math.ceil), ay(y0, math.ceil), ax(x1, math.floor), ay(y1, math.floor))
-        h15 = gdal.Warp('', ds, format='MEM', outputBounds=caja, xRes=15, yRes=15, resampleAlg='average',
-                        srcNodata=nd, dstNodata=NODATA).ReadAsArray()
-        c15 = gdal.Warp('', str(cem), format='MEM', outputBounds=caja, xRes=15, yRes=15, resampleAlg='near',
-                        dstNodata=NODATA).ReadAsArray()
-        ok = (h15 != NODATA) & (c15 != NODATA)
-        d = (h15 - c15)[ok]
-        med = float(np.median(d)) if d.size else None
-        resultados[clave] = {
-            'sin_dato_pct': sin_dato, 'sesgo_m': med,
-            'nmad_m': float(1.4826 * np.median(np.abs(d - med))) if d.size else None,
-            'p95_abs_m': float(np.percentile(np.abs(d), 95)) if d.size else None,
-            'costura_m': None, 'gt': gt, 'forma': (ds.RasterXSize, ds.RasterYSize), 'archivo': archivo, 'nd': nd}
+        opc = dict(format='MEM', outputBounds=caja, xRes=15, yRes=15)
+        h15 = gdal.Warp('', ds, resampleAlg='average', srcNodata=nd, dstNodata=NODATA, **opc).ReadAsArray()
+        a15 = gdal.Warp('', _mem(abierto.astype(np.float32), gt, srs), resampleAlg='average', **opc).ReadAsArray()
+        c15 = gdal.Warp('', str(cem), resampleAlg='near', dstNodata=NODATA, **opc).ReadAsArray()
         ds = None
+        ok = (h15 != NODATA) & (c15 != NODATA)
+        d_todo = (h15 - c15)[ok]
+        d_abierto = (h15 - c15)[ok & (a15 >= 0.9)]
+        sesgo, nmad, p95 = _estadisticas(d_todo)
+        sesgo_a, nmad_a, _ = _estadisticas(d_abierto)
+        resultados[clave] = {
+            'sin_dato_pct': sin_dato, 'pct_abierto': pct_abierto, 'sesgo_m': sesgo, 'nmad_m': nmad, 'p95_abs_m': p95,
+            'sesgo_abierto_m': sesgo_a, 'nmad_abierto_m': nmad_a, 'celdas_abiertas': int(d_abierto.size),
+            'costura_m': None, 'costura_abierto_m': None, 'gt': gt, 'forma': (t.shape[1], t.shape[0]),
+            'archivo': archivo, 'archivo_sup': archivo_sup, 'nd': nd, 'nds': nds}
+    # desfase de cada hoja respecto a la mediana de la zona (en terreno abierto)
+    sesgos = [r['sesgo_abierto_m'] for r in resultados.values() if r['sesgo_abierto_m'] is not None]
+    med_zona = float(np.median(sesgos)) if sesgos else 0.0
+    for r in resultados.values():
+        r['desfase_m'] = None if r['sesgo_abierto_m'] is None else abs(r['sesgo_abierto_m'] - med_zona)
 
-    # costuras: donde dos hojas vecinas se enciman, mediana de |diferencia|. La ventana se ajusta a la rejilla de la
-    # primera; si la segunda está corrida (algunas ediciones empiezan medio píxel después), se interpola a esa rejilla.
-    import math
+    # costuras: donde dos hojas vecinas se enciman, mediana de |diferencia| (en todo y solo en terreno abierto de las
+    # dos). La ventana se ajusta a la rejilla de la primera; si la segunda está corrida (algunas ediciones empiezan
+    # medio píxel después), se interpola a esa rejilla.
     claves = list(resultados)
     for i, ca in enumerate(claves):
         for cb in claves[i + 1:]:
@@ -505,35 +733,55 @@ def paso_calidad() -> None:
             if ix1 - ix0 < 10 * px or iy1 - iy0 < 10 * px:
                 continue
             caja = (ix0, iy0, ix1, iy1)
-            va = gdal.Warp('', str(RAIZ / ra['archivo']), format='MEM', outputBounds=caja, xRes=px, yRes=px,
-                           resampleAlg='near', srcNodata=ra['nd'], dstNodata=NODATA).ReadAsArray()
-            vb = gdal.Warp('', str(RAIZ / rb['archivo']), format='MEM', outputBounds=caja, xRes=px, yRes=px,
-                           resampleAlg='bilinear', srcNodata=rb['nd'], dstNodata=NODATA).ReadAsArray()
-            ok = (va != NODATA) & (vb != NODATA)
+
+            def leer(archivo, nd, alg):
+                return gdal.Warp('', str(RAIZ / archivo), format='MEM', outputBounds=caja, xRes=px, yRes=px,
+                                 resampleAlg=alg, srcNodata=nd, dstNodata=NODATA).ReadAsArray()
+
+            ta, sa = leer(ra['archivo'], ra['nd'], 'near'), leer(ra['archivo_sup'], ra['nds'], 'near')
+            tb, sb = leer(rb['archivo'], rb['nd'], 'bilinear'), leer(rb['archivo_sup'], rb['nds'], 'bilinear')
+            ok = (ta != NODATA) & (tb != NODATA)
             if ok.sum() < 100:
                 continue
-            c = float(np.median(np.abs(va[ok] - vb[ok])))
+            abierto = ok & (sa != NODATA) & (sb != NODATA) & ((sa - ta) < ABIERTO_M) & ((sb - tb) < ABIERTO_M)
+            c = float(np.median(np.abs(ta[ok] - tb[ok])))
+            ca_ = float(np.median(np.abs(ta[abierto] - tb[abierto]))) if abierto.sum() >= 100 else None
             for k in (ca, cb):
                 resultados[k]['costura_m'] = max(c, resultados[k]['costura_m'] or 0)
+                if ca_ is not None:
+                    resultados[k]['costura_abierto_m'] = max(ca_, resultados[k]['costura_abierto_m'] or 0)
 
     filas = []
+    f = lambda v, fmt: '' if v is None else format(v, fmt)
     with con.transaction():
         for clave, r in resultados.items():
-            motivos = [k for k, u in UMBRAL.items()
-                       if r[k] is not None and (abs(r[k]) if k == 'sesgo_m' else r[k]) > u]
+            motivos = [k for k, u in UMBRAL.items() if r[k] is not None and r[k] > u]
             revision = 'ok' if not motivos else 'revisar: ' + ', '.join(motivos)
             con.execute("""update terreno.hojas set sin_dato_pct = %s, sesgo_m = %s, nmad_m = %s, p95_abs_m = %s,
-                           costura_m = %s, revision = %s where clave = %s""",
-                        (r['sin_dato_pct'], r['sesgo_m'], r['nmad_m'], r['p95_abs_m'], r['costura_m'], revision, clave))
-            filas.append((clave, f"{r['sin_dato_pct']:.2f}", f"{r['sesgo_m']:+.2f}", f"{r['nmad_m']:.2f}",
-                          f"{r['p95_abs_m']:.1f}", '' if r['costura_m'] is None else f"{r['costura_m']:.2f}", revision))
+                             costura_m = %s, pct_abierto = %s, sesgo_abierto_m = %s, nmad_abierto_m = %s,
+                             desfase_m = %s, costura_abierto_m = %s, revision = %s
+                           where clave = %s""",
+                        (r['sin_dato_pct'], r['sesgo_m'], r['nmad_m'], r['p95_abs_m'], r['costura_m'], r['pct_abierto'],
+                         r['sesgo_abierto_m'], r['nmad_abierto_m'], r['desfase_m'], r['costura_abierto_m'], revision,
+                         clave))
+            filas.append((clave, f(r['pct_abierto'], '.0f'), f(r['sesgo_m'], '+.2f'), f(r['sesgo_abierto_m'], '+.2f'),
+                          f(r['nmad_abierto_m'], '.2f'), f(r['desfase_m'], '.2f'), f(r['costura_m'], '.2f'),
+                          f(r['costura_abierto_m'], '.2f'), revision))
     from fase0 import tabla
-    tabla(filas, ('hoja', 'sin dato %', 'sesgo m', 'NMAD m', 'p95 |d| m', 'costura m', 'revisión'))
+    tabla(filas, ('hoja', 'abierto %', 'hoja−CEM', 'en abierto', 'NMAD ab.', 'desfase', 'costura', 'cost. ab.',
+                  'revisión'))
     d = consulta(con, """select count(*), count(*) filter (where revision = 'ok'),
                                 percentile_cont(0.5) within group (order by sesgo_m),
-                                percentile_cont(0.5) within group (order by nmad_m)
+                                percentile_cont(0.5) within group (order by sesgo_abierto_m),
+                                percentile_cont(0.5) within group (order by nmad_abierto_m)
                          from terreno.hojas where %s = any(zonas) and revision is not null""", (zona,))[0]
-    log(f'calidad {zona}: {d[1]} de {d[0]} hojas ok · sesgo mediano {d[2]:+.2f} m · NMAD mediana {d[3]:.2f} m (contra CEM 4.0)')
+    log(f'calidad {zona}: {d[1]} de {d[0]} hojas ok · hoja − CEM: {d[2]:+.2f} m en todo, {d[3]:+.2f} m en terreno '
+        f'abierto (NMAD {d[4]:.2f} m): el CEM queda por encima del terreno, más bajo bosque y ciudad')
+
+
+def correr_sql_fase1(con) -> None:
+    from comun import SQL, correr_sql
+    correr_sql(con, SQL / 'fase1' / '01_terreno.sql')
 
 
 # ── PostGIS: rásters fuera de la base y altitud por SQL ─────────────────────────────────────────────────────────────
@@ -622,8 +870,8 @@ comment on function terreno.altitud(geometry) is 'Altitud (m sobre el nivel medi
             f'|ITER − fino| mediana {r[3]:.1f} m')
 
 
-PASOS = {'cem': paso_cem, 'hojas': paso_hojas, 'relieve': paso_relieve, 'calidad': paso_calidad,
-         'registrar': paso_registrar}
+PASOS = {'cem': paso_cem, 'hojas': paso_hojas, 'normalizar': paso_normalizar, 'relieve': paso_relieve,
+         'calidad': paso_calidad, 'registrar': paso_registrar}
 
 
 def main() -> int:
