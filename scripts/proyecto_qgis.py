@@ -67,6 +67,18 @@ CAPAS = [
         ('qgis.culturas_rutas', None, False, ''),
         ('qgis.culturas_provincias', None, False, ''),
     ]),
+    ('Relieve', [
+        ('terreno.zonas', 'Zonas de trabajo', True, '"zona" <> \'estado\''),
+        ('terreno.hojas', 'Hojas de INEGI (control de calidad)', False, ''),
+        ('terreno.cobertura', 'Qué tan fino es el relieve', False, ''),
+        ('archivo:sombreado_piloto_1p5m', 'Sombreado, piloto (1.5 m)', True, ''),
+        ('archivo:sombreado_hidalgo_15m', 'Sombreado, Hidalgo (15 m)', True, ''),
+        ('archivo:pendiente_piloto_1p5m', 'Pendiente, piloto (1.5 m)', False, ''),
+        ('archivo:pendiente_hidalgo_15m', 'Pendiente, Hidalgo (15 m)', False, ''),
+        ('archivo:relieve_piloto_1p5m', 'Altitud, piloto (1.5 m)', False, ''),
+        ('archivo:cem4_15m', 'Altitud, Hidalgo (CEM 4.0, 15 m)', False, ''),
+        ('archivo:ajuste_cem_piloto_15m', 'Ajuste del CEM hacia las hojas, piloto (m)', False, ''),
+    ]),
     ('Uso de suelo (1:250 000)', [
         ('qgis.uso_suelo', 'Uso de suelo, Serie VII (2018)', True, '"serie" = 7'),
         ('qgis.uso_suelo', 'Uso de suelo, Serie VI (2014)', False, '"serie" = 6'),
@@ -134,6 +146,26 @@ def estilo(lyr: QgsVectorLayer, capa: str, grupos_suelo: list[tuple]) -> None:
         q = QColor(colores.get(capa, '#888888'))
         lyr.renderer().setSymbol(QgsFillSymbol.createSimple(
             {'color': f'{q.red()},{q.green()},{q.blue()},35', 'outline_color': q.name(), 'outline_width': '0.4'}))
+    elif capa == 'terreno.zonas':
+        lyr.renderer().setSymbol(QgsFillSymbol.createSimple(
+            {'style': 'no', 'outline_color': '#d7191c', 'outline_width': '0.6', 'outline_style': 'dash'}))
+    elif capa == 'terreno.cobertura':
+        colores = {'1.5 m': '#1a9850', '5 m': '#fee08b', '15 m (solo CEM)': '#d73027'}
+        cats = [QgsRendererCategory(r, QgsFillSymbol.createSimple(
+                    {'color': f'{QColor(c).red()},{QColor(c).green()},{QColor(c).blue()},110', 'outline_style': 'no'}), r)
+                for r, c in colores.items()]
+        lyr.setRenderer(QgsCategorizedSymbolRenderer('resolucion', cats))
+    elif capa == 'terreno.hojas':
+        from qgis.core import QgsRuleBasedRenderer
+        sym = QgsFillSymbol.createSimple({'style': 'no', 'outline_color': '#2b83ba', 'outline_width': '0.3'})
+        raiz = QgsRuleBasedRenderer.Rule(None)
+        for etiqueta, expr, color in (('ok', '"revision" = \'ok\'', '#1a9850'),
+                                      ('revisar', '"revision" LIKE \'revisar%\'', '#d73027'),
+                                      ('sin revisar', '"revision" IS NULL', '#2b83ba')):
+            s = sym.clone()
+            s.symbolLayer(0).setStrokeColor(QColor(color))
+            raiz.appendChild(QgsRuleBasedRenderer.Rule(s, 0, 0, expr, etiqueta))
+        lyr.setRenderer(QgsRuleBasedRenderer(raiz))
     elif capa == 'qgis.uso_suelo':
         cats = []
         for gid, nombre, color in grupos_suelo:
@@ -164,14 +196,74 @@ def estilo(lyr: QgsVectorLayer, capa: str, grupos_suelo: list[tuple]) -> None:
              'outline_color': '#ffffff', 'outline_width': '0.15'}))
 
 
-def ficha(lyr: QgsVectorLayer, m: dict) -> None:
+TERRENO = RAIZ / 'datos' / 'terreno'
+
+# Tintas hipsométricas: de las tierras bajas de la Huasteca (verde) a las cumbres (blanco), en fracciones del rango.
+HIPSOMETRIA = [(0.00, '#3e7b4f'), (0.15, '#7da55b'), (0.32, '#c8c27c'), (0.50, '#c49a63'), (0.68, '#9a7353'),
+               (0.85, '#d9cfc4'), (1.00, '#ffffff')]
+
+
+def capa_raster(nombre_archivo: str, nombre: str):
+    """Capa de un GeoTIFF de datos/terreno con su estilo, o None si todavía no existe."""
+    from osgeo import gdal
+    from qgis.core import (QgsColorRampShader, QgsRasterLayer, QgsRasterShader, QgsSingleBandPseudoColorRenderer)
+    from qgis.PyQt.QtGui import QPainter
+    ruta = TERRENO / f'{nombre_archivo}.tif'
+    if not ruta.exists():
+        return None
+    lyr = QgsRasterLayer(str(ruta), nombre)
+    if not lyr.isValid():
+        raise RuntimeError(f'No se pudo abrir {ruta}')
+
+    def rampa(vmin, vmax, paradas):
+        sh = QgsColorRampShader(vmin, vmax)
+        sh.setColorRampType(QgsColorRampShader.Interpolated)
+        sh.setColorRampItemList([QgsColorRampShader.ColorRampItem(vmin + f * (vmax - vmin), QColor(c), f'{vmin + f * (vmax - vmin):,.0f}')
+                                 for f, c in paradas])
+        rs = QgsRasterShader()
+        rs.setRasterShaderFunction(sh)
+        r = QgsSingleBandPseudoColorRenderer(lyr.dataProvider(), 1, rs)
+        r.setClassificationMin(vmin)
+        r.setClassificationMax(vmax)
+        lyr.setRenderer(r)
+
+    if nombre_archivo.startswith('sombreado'):
+        lyr.setBlendMode(QPainter.CompositionMode_Multiply)
+        lyr.setOpacity(0.75)
+        # para que no se sumen los dos sombreados: el fino al acercarse más de 1:50 000, el del estado al alejarse
+        lyr.setScaleBasedVisibility(True)
+        if '1p5m' in nombre_archivo:
+            lyr.setMinimumScale(50_000)
+        else:
+            lyr.setMaximumScale(50_000)
+    elif nombre_archivo.startswith('pendiente'):
+        rampa(0, 45, [(0, '#ffffcc'), (0.33, '#fd8d3c'), (0.66, '#e31a1c'), (1, '#4a1486')])
+    elif nombre_archivo.startswith('ajuste'):
+        rampa(-12, 4, [(0, '#2166ac'), (0.5, '#92c5de'), (0.75, '#f7f7f7'), (1, '#b2182b')])
+    else:   # altitud
+        ds = gdal.Open(str(ruta))   # el dataset debe vivir mientras se usa su banda
+        vmin, vmax = ds.GetRasterBand(1).ComputeRasterMinMax(True)
+        ds = None
+        rampa(vmin, vmax, HIPSOMETRIA)
+        try:   # que el perfil de elevación y el 3D la reconozcan como superficie de terreno
+            from qgis.core import Qgis
+            ep = lyr.elevationProperties()
+            ep.setEnabled(True)
+            ep.setMode(Qgis.RasterElevationMode.RepresentsElevationSurface)
+        except Exception:
+            pass
+    return lyr
+
+
+def ficha(lyr, m: dict) -> None:
     md = lyr.metadata()
     partes = [m.get('notas') or '',
               f"Fuente: {m['fuentes']}" if m.get('fuentes') else '',
               f"Fecha de los datos: {m['fecha_datos']}" if m.get('fecha_datos') else '',
               f"Escala o resolución de origen: {m['escala']}" if m.get('escala') else '',
               f"Detalle (tamaño más chico que distingue): ≈ {m['detalle_m']:g} m" if m.get('detalle_m') else '',
-              f"Tabla: {m['capa']} · {m['filas']:,} elementos · EPSG:{m['srid']}"]
+              (f"Archivo: {m['capa'].split(':', 1)[1]} · EPSG:6369" if m['capa'].startswith('archivo:')
+               else f"Tabla: {m['capa']} · {m['filas'] or 0:,} elementos · EPSG:{m['srid']}")]
     md.setTitle(m.get('titulo') or m['capa'])
     md.setAbstract('\n'.join(p for p in partes if p))
     lyr.setMetadata(md)
@@ -193,7 +285,7 @@ def main() -> int:
         join pg_namespace n on n.oid = c.relnamespace
         cross join lateral unnest(i.indkey) with ordinality as x(attnum, ord)
         join pg_attribute a on a.attrelid = i.indrelid and a.attnum = x.attnum
-        where i.indisprimary and n.nspname in ('base', 'qgis')
+        where i.indisprimary and n.nspname in ('base', 'qgis', 'terreno')
         group by 1"""))
     grupos_suelo = consulta(con, 'select id, nombre, color from relieve.uso_suelo_grupos order by id')
     xmin, ymin, xmax, ymax = consulta(con, """
@@ -209,20 +301,41 @@ def main() -> int:
         proj.setTitle('Relieve de Hidalgo')
         proj.setEllipsoid('EPSG:7019')   # GRS80, el elipsoide de ITRF2008: medidas en el lienzo sobre el elipsoide
         raiz = proj.layerTreeRoot()
-        n = 0
+        n, terreno_3d = 0, None
         for grupo, capas in CAPAS:
             nodo_grupo = raiz.addGroup(grupo)
             for capa, nombre, visible, filtro in capas:
-                m = meta[capa]
-                lyr = capa_pg(capa, nombre or m['titulo'] or capa, claves[capa], m['geometria'], filtro)
-                estilo(lyr, capa, grupos_suelo)
-                ficha(lyr, m)
+                if capa.startswith('archivo:'):
+                    archivo = capa.split(':', 1)[1]
+                    lyr = capa_raster(archivo, nombre)
+                    if lyr is None:
+                        log(f'  falta datos/terreno/{archivo}.tif: se omite (corre la fase 1)')
+                        continue
+                    m = meta.get(f'archivo:datos/terreno/{archivo}.tif')
+                    if archivo == 'relieve_piloto_1p5m' or (archivo == 'cem4_15m' and terreno_3d is None):
+                        terreno_3d = lyr
+                else:
+                    if capa not in meta:
+                        log(f'  falta la tabla {capa}: se omite')
+                        continue
+                    m = meta[capa]
+                    lyr = capa_pg(capa, nombre or m['titulo'] or capa, claves[capa], m['geometria'], filtro)
+                    estilo(lyr, capa, grupos_suelo)
+                if m:
+                    ficha(lyr, m)
                 proj.addMapLayer(lyr, False)
                 nodo = nodo_grupo.addLayer(lyr)
                 nodo.setItemVisibilityChecked(visible)
                 nodo.setExpanded(False)
                 n += 1
-            nodo_grupo.setExpanded(grupo in ('Límites', 'Agua'))
+            nodo_grupo.setExpanded(grupo in ('Límites', 'Agua', 'Relieve'))
+        if terreno_3d is not None:
+            # Terreno del proyecto: lo usan el perfil de elevación y las vistas 3D nuevas
+            from qgis.core import QgsRasterDemTerrainProvider
+            prov = QgsRasterDemTerrainProvider()
+            prov.setLayer(terreno_3d)
+            proj.elevationProperties().setTerrainProvider(prov)
+            log(f'  terreno 3D del proyecto: {terreno_3d.name()}')
         proj.viewSettings().setDefaultViewExtent(QgsReferencedRectangle(QgsRectangle(xmin, ymin, xmax, ymax), crs))
         DESTINO.parent.mkdir(parents=True, exist_ok=True)
         if DESTINO.exists():

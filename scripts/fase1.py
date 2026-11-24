@@ -795,7 +795,10 @@ def registrar_raster(archivo: Path, tabla: str) -> None:
     import os
     import subprocess
     from comun import CFG
-    env = {**os.environ, 'PGPASSWORD': CFG['DB_PASSWORD']}
+    # raster2pgsql usa el GDAL de PostGIS: sin las rutas de GDAL y PROJ que fija el lanzador de QGIS
+    env = {k: v for k, v in os.environ.items() if k not in ('GDAL_DRIVER_PATH', 'GDAL_DATA', 'PROJ_DATA', 'PROJ_LIB')}
+    env.update({'PGPASSWORD': CFG['DB_PASSWORD'], 'GDAL_DATA': str(PG_BIN.parent / 'gdal-data'),
+                'PROJ_LIB': str(PG_BIN.parent / 'share' / 'contrib' / 'postgis-3.6' / 'proj')})
     r2p = subprocess.Popen([str(PG_BIN / 'raster2pgsql.exe'), '-s', str(SRID), '-t', '512x512', '-R', '-I', '-C', '-M',
                             '-d', '-Y', str(archivo.resolve()), tabla], stdout=subprocess.PIPE, env=env)
     psql = subprocess.run([str(PG_BIN / 'psql.exe'), '-q', '-h', CFG['DB_HOST'], '-p', CFG.get('DB_PORT', '5432'),
@@ -839,7 +842,7 @@ language sql stable parallel safe as $f$
   select v from (
 {ramas}
     select ST_Value(r.rast, p) from terreno.r_cem4_15m r where ST_Intersects(r.rast, p)
-  ) x where v is not null limit 1
+  ) x(v) where v is not null limit 1
 $f$;
 comment on function terreno.altitud(geometry) is 'Altitud (m sobre el nivel medio del mar) del mejor relieve disponible en un punto EPSG:6369: el de 1.5 m de una zona si lo hay, si no el CEM 4.0 de 15 m';""")
     correr_sql(con, SQL / 'fase0' / '04_meta.sql')
