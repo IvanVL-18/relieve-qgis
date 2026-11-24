@@ -1,0 +1,5 @@
+* text=auto
+*.bat text eol=crlf
+*.sql text eol=lf
+*.py text eol=lf
+*.qgz binary

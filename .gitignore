@@ -1,0 +1,15 @@
+# Credenciales
+.env
+
+# Descargas y productos pesados (se regeneran con los scripts)
+datos/
+
+# Python
+__pycache__/
+*.pyc
+
+# QGIS: respaldos y archivos auxiliares
+*.qgz.bak
+*.qgs~
+*.aux.xml
+.qgis-cache/
