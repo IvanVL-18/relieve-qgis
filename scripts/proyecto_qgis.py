@@ -30,6 +30,14 @@ CAPAS = [
         ('base.municipios_edomex', None, False, ''),
         ('base.entidades', None, False, ''),
     ]),
+    ('Edificios y árboles (piloto)', [
+        ('terreno.arboles', 'Árboles (copa a escala)', True, '"zona" = \'piloto\' AND "tipo" = \'árbol\''),
+        ('terreno.arboles', 'Por revisar: posibles construcciones y picos', False,
+         '"zona" = \'piloto\' AND "tipo" <> \'árbol\''),
+        ('terreno.edificios', 'Edificios por pisos (altura medida)', True, '"zona" = \'piloto\''),
+        ('archivo:dosel_piloto_1p5m', 'Altura de la vegetación, piloto (1.5 m)', False, ''),
+        ('archivo:altura_suelo_piloto_1p5m', 'Altura sobre el suelo, piloto (1.5 m)', False, ''),
+    ]),
     ('Calles y manzanas (piloto)', [
         ('terreno.calles', 'Calles por pendiente máxima en 20 m', True, '"zona" = \'piloto\''),
         ('base.mg_servicios_a', 'Parques, escuelas y espacios públicos (INEGI 2025)', True, ''),
@@ -160,6 +168,31 @@ def estilo(lyr: QgsVectorLayer, capa: str, grupos_suelo: list[tuple]) -> None:
         q = QColor(colores.get(capa, '#888888'))
         lyr.renderer().setSymbol(QgsFillSymbol.createSimple(
             {'color': f'{q.red()},{q.green()},{q.blue()},35', 'outline_color': q.name(), 'outline_width': '0.4'}))
+    elif capa == 'terreno.edificios':
+        from qgis.core import QgsRuleBasedRenderer
+        raiz = QgsRuleBasedRenderer.Rule(None)
+        for etiqueta, expr, color in (('1 piso', '"pisos" = 1', '#f3e3c3'), ('2 pisos', '"pisos" = 2', '#e3c18f'),
+                                      ('3 pisos', '"pisos" = 3', '#c99a5b'), ('4 a 5 pisos', '"pisos" BETWEEN 4 AND 5', '#a0673a'),
+                                      ('6 pisos o más', '"pisos" >= 6', '#6d3b1f'),
+                                      ('sin medida (el modelo no lo ve)', '"pisos" IS NULL', '#cfcfcf')):
+            s = QgsFillSymbol.createSimple({'color': color, 'outline_color': '#7a6a58', 'outline_width': '0.1'})
+            raiz.appendChild(QgsRuleBasedRenderer.Rule(s, 0, 0, expr, etiqueta))
+        lyr.setRenderer(QgsRuleBasedRenderer(raiz))
+        lyr.setScaleBasedVisibility(True)
+        lyr.setMinimumScale(30_000)
+        edificios_3d(lyr)
+    elif capa == 'terreno.arboles':
+        from qgis.core import QgsUnitTypes
+        revisar = 'revisar' in lyr.name().lower()
+        sym = QgsMarkerSymbol.createSimple({'name': 'circle', 'color': '240,140,40,160' if revisar else '74,140,62,170',
+                                            'outline_color': '#a0521a' if revisar else '#2f5d2a', 'outline_width': '0.1'})
+        sym.setSizeUnit(QgsUnitTypes.RenderMapUnits)       # el círculo mide lo que la copa en el terreno
+        sym.setDataDefinedSize(QgsProperty.fromExpression('coalesce("copa_diam_m", 3)'))
+        lyr.renderer().setSymbol(sym)
+        lyr.setScaleBasedVisibility(True)
+        lyr.setMinimumScale(15_000)
+        if not revisar:
+            arboles_3d(lyr)
     elif capa == 'terreno.calles':
         from qgis.core import QgsRuleBasedRenderer
         raiz = QgsRuleBasedRenderer.Rule(None)
@@ -316,6 +349,70 @@ def agua_3d(lyr) -> None:
         log(f'  (sin agua plana en 3D: {e})')
 
 
+def _clases_3d():
+    """Clases 3D de PyQGIS: según la versión viven en qgis._3d o en qgis.core."""
+    import qgis._3d as q3
+    import qgis.core as qc
+    return lambda n: getattr(q3, n, None) or getattr(qc, n)
+
+
+def _material(color: str, ambiente: str):
+    clase = _clases_3d()
+    mat = clase('QgsPhongMaterialSettings')()
+    mat.setDiffuse(QColor(color))
+    mat.setAmbient(QColor(ambiente))
+    mat.setSpecular(QColor('#202020'))
+    mat.setShininess(5)
+    return mat
+
+
+def edificios_3d(lyr) -> None:
+    """En 3D, cada edificio extruido a su altura medida (3 m si no la tiene) desde el terreno en su centro."""
+    try:
+        from qgis.core import Qgis, QgsProperty
+        clase = _clases_3d()
+        sim = clase('QgsPolygon3DSymbol')()
+        sim.setAltitudeClamping(Qgis.AltitudeClamping.Terrain)
+        sim.setAltitudeBinding(Qgis.AltitudeBinding.Centroid)
+        sim.setExtrusionHeight(3)
+        sim.setMaterialSettings(_material('#d8c7a8', '#7d6e58'))
+        A = clase('QgsAbstract3DSymbol')
+        prop = getattr(A, 'Property', None)
+        clave = prop.ExtrusionHeight if prop is not None and hasattr(prop, 'ExtrusionHeight') else A.PropertyExtrusionHeight
+        sim.dataDefinedProperties().setProperty(clave, QgsProperty.fromExpression('coalesce("altura_m", 3)'))
+        lyr.setRenderer3D(clase('QgsVectorLayer3DRenderer')(sim))
+    except Exception as e:
+        log(f'  (edificios sin extrusión 3D: {e})')
+
+
+def arboles_3d(lyr) -> None:
+    """En 3D, la copa de cada árbol como esfera por clase de altura (radio y altura de la copa de la clase)."""
+    try:
+        from qgis.core import Qgis
+        from qgis.PyQt.QtGui import QMatrix4x4
+        clase = _clases_3d()
+        Regla = clase('QgsRuleBased3DRenderer').Rule
+        raiz = Regla(None)
+        # radio ≈ la mitad de la copa mediana medida en cada clase; centro de la copa a ≈ 2/3 de la altura
+        for expr, radio, centro in (('"altura_m" < 8', 2.5, 4.0), ('"altura_m" >= 8 AND "altura_m" < 15', 4.0, 8.5),
+                                    ('"altura_m" >= 15 AND "altura_m" < 25', 5.0, 15.0), ('"altura_m" >= 25', 5.5, 24.0)):
+            sim = clase('QgsPoint3DSymbol')()
+            sim.setAltitudeClamping(Qgis.AltitudeClamping.Relative)
+            sim.setShape(Qgis.Point3DShape.Sphere)
+            if hasattr(sim, 'setShapeProperty'):
+                sim.setShapeProperty('radius', radio)
+            else:                                # QGIS 3.44: propiedades de la forma como diccionario
+                sim.setShapeProperties({'radius': radio})
+            m = QMatrix4x4()
+            m.translate(0, 0, centro)      # QGIS ≥ 3.36: mundo 3D con z hacia arriba
+            sim.setTransform(m)
+            sim.setMaterialSettings(_material('#4f8a3c', '#24451c'))
+            raiz.appendChild(Regla(sim, expr))
+        lyr.setRenderer3D(clase('QgsRuleBased3DRenderer')(raiz))
+    except Exception as e:
+        log(f'  (árboles sin 3D: {e})')
+
+
 def capa_raster(nombre_archivo: str, nombre: str):
     """Capa de un GeoTIFF de datos/terreno con su estilo, o None si todavía no existe."""
     from osgeo import gdal
@@ -353,6 +450,10 @@ def capa_raster(nombre_archivo: str, nombre: str):
         rampa(0, 45, [(0, '#ffffcc'), (0.33, '#fd8d3c'), (0.66, '#e31a1c'), (1, '#4a1486')])
     elif nombre_archivo.startswith('ajuste'):
         rampa(-12, 4, [(0, '#2166ac'), (0.5, '#92c5de'), (0.75, '#f7f7f7'), (1, '#b2182b')])
+    elif nombre_archivo.startswith('dosel'):
+        rampa(0, 35, [(0, '#f7fcf5'), (0.08, '#c7e9c0'), (0.3, '#74c476'), (0.6, '#238b45'), (1, '#00441b')])
+    elif nombre_archivo.startswith('altura_suelo'):
+        rampa(0, 30, [(0, '#ffffff'), (0.1, '#fee391'), (0.4, '#fe9929'), (0.7, '#cc4c02'), (1, '#662506')])
     else:   # altitud
         ds = gdal.Open(str(ruta))   # el dataset debe vivir mientras se usa su banda
         vmin, vmax = ds.GetRasterBand(1).ComputeRasterMinMax(True)

@@ -22,6 +22,7 @@ correr scripts\fase1.py calidad      :: control de calidad de cada hoja (terreno
 correr scripts\fase1.py registrar    :: rásters en PostGIS y terreno.altitud(punto) por SQL
 correr scripts\fase2.py mg topo50 osm       :: calles y manzanas de INEGI 2025, cartas 1:50 000 y OpenStreetMap
 correr scripts\fase2.py drenaje agua calles :: cauces y subcuencas (GRASS), cuerpos de agua y pendiente de calles
+correr scripts\fase3.py edificios arboles  :: edificios con altura medida y árboles uno por uno (≈ 20 min)
 correr scripts\proyecto_qgis.py --forzar   :: rehace qgis\RelieveHidalgo.qgz con el relieve y el terreno 3D
 correr scripts\vista_previa.py       :: PNG del proyecto en datos\vistas, sin abrir QGIS
 correr scripts\vista_3d.py pachuca 522000 2223000 6000 65 200   :: vista 3D a PNG
@@ -92,6 +93,20 @@ decidir sobre un predio. Cada análisis reporta el mayor `detalle_m` de lo que u
 - El proyecto trae **marcadores** (Todo Hidalgo, zona piloto, Pachuca, Mineral del Monte, Mineral del Chico,
   Pachuquilla): panel «Marcadores espaciales».
 
+## Edificios y árboles (fase 3, piloto)
+
+- **Altura sobre el suelo** (superficie − terreno de INEGI, 1.5 m): `altura_suelo_piloto_1p5m.tif`.
+- **Edificios** (`terreno.edificios`, 168 375 en la zona): contornos de Microsoft con la altura **medida** del techo
+  (mediana de los píxeles de más de 2 m). 83 102 con confianza alta (mediana 4.4 m), 44 875 media y 40 398 sin
+  medida (el modelo no los distingue del suelo; en 3D se dibujan con 3 m). Contra los niveles de OpenStreetMap
+  (1 320 edificios): los mismos pisos en el 49 % y ±1 piso en el 89 %. En 3D se extruyen a su altura.
+- **Árboles** (`terreno.arboles`): 865 267 árboles de 3 m o más con su altura y su copa, más 44 281 «posibles
+  construcciones» (techos planos dentro de localidades sin contorno de Microsoft) y 3 122 «picos dudosos», que
+  quedan aparte para revisar. Dosel en `dosel_piloto_1p5m.tif`.
+- **Control contra el dosel de Meta y WRI** (`terreno.control_dosel`): en bosque cerrado vemos ≈ la mitad del
+  dosel que Meta (El Chico: 45 % contra 82 %) porque bajo bosque el terreno de INEGI es una interpolación; ahí el
+  conteo y las alturas son un mínimo. En ciudad y campo vemos más dosel que Meta (árboles chicos que Meta no ve).
+
 ## Fases
 
 0. **Base** (lista): PostGIS, límites oficiales, capas con geometría, catálogo de capas y proyecto de QGIS.
@@ -100,7 +115,7 @@ decidir sobre un predio. Cada análisis reporta el mayor `detalle_m` de lo que u
    calidad de cada hoja y terreno 3D del proyecto.
 2. **Agua y calles** (lista en el piloto): cauces y subcuencas del relieve fino, cuerpos de agua con su nivel, calles
    y manzanas de INEGI 2025 con la pendiente de cada calle, OpenStreetMap.
-3. **Edificios y árboles**: altura medida (superficie − terreno) de cada edificio y árboles uno por uno.
+3. **Edificios y árboles** (lista en el piloto): altura medida de cada edificio y árboles uno por uno, en 3D.
 4. **Análisis**: reforestación, aptitud para construir, trazos de caminos con cortes y rellenos.
 
 ## Estructura
@@ -111,11 +126,12 @@ scripts/comun.py         configuración, conexión, descargas, carga con GDAL, s
 scripts/fase0.py         fase 0 completa con validación
 scripts/fase1.py         fase 1 por pasos: cem, hojas, relieve, calidad, registrar
 scripts/fase2.py         fase 2 por pasos: mg, topo50, osm, drenaje, agua, calles
+scripts/fase3.py         fase 3 por pasos: altura, edificios, arboles
 scripts/inegi.py         catálogo de INEGI, zips remotos por rangos y descargas en paralelo
 scripts/proyecto_qgis.py arma el proyecto de QGIS
 scripts/vista_previa.py  renderiza el proyecto a PNG
 scripts/vista_3d.py      renderiza una vista 3D a PNG
-sql/fase0/ … sql/fase2/  SQL de cada fase, en orden
+sql/fase0/ … sql/fase3/  SQL de cada fase, en orden
 qgis/                    proyecto de QGIS
 datos/                   descargas y productos (no se versiona)
 ```

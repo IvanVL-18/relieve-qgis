@@ -38,7 +38,12 @@ def main() -> int:
     qgs = QgsApplication([], True)    # con interfaz gráfica: el motor 3D necesita OpenGL
     qgs.initQgis()
     try:
+        import qgis._3d as q3
         from qgis._3d import Qgs3DMapSettings, QgsCameraPose, QgsDemTerrainSettings, QgsLayoutItem3DMap
+        # Sin esto, al leer el proyecto las capas pierden su representación 3D (edificios extruidos, árboles, agua):
+        # la aplicación de QGIS la registra al arrancar, un script suelto no.
+        if hasattr(q3, 'Qgs3D'):
+            q3.Qgs3D.initialize()
         proj = QgsProject.instance()
         if not proj.read(str(PROYECTO)):
             raise RuntimeError(f'No se pudo abrir {PROYECTO}')
@@ -76,6 +81,13 @@ def main() -> int:
         s.setTerrainSettings(t)
         s.setBackgroundColor(QColor('#c9dcef'))
         s.setOutputDpi(96)
+        try:   # luz de sol desde el sureste, para que se distingan techos y fachadas
+            sol = q3.QgsDirectionalLightSettings()
+            sol.setDirection(QgsVector3D(-0.5, 0.6, -0.7))
+            sol.setIntensity(1.0)
+            s.setLightSources([sol])
+        except Exception as e:
+            log(f'(sin luz direccional: {e})')
 
         layout = QgsPrintLayout(proj)
         layout.initializeDefaults()
