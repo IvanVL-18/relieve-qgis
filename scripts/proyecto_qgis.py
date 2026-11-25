@@ -30,6 +30,20 @@ CAPAS = [
         ('base.municipios_edomex', None, False, ''),
         ('base.entidades', None, False, ''),
     ]),
+    ('Calles y manzanas (piloto)', [
+        ('terreno.calles', 'Calles por pendiente máxima en 20 m', True, '"zona" = \'piloto\''),
+        ('base.mg_servicios_a', 'Parques, escuelas y espacios públicos (INEGI 2025)', True, ''),
+        ('base.mg_manzanas', 'Manzanas (INEGI 2025)', True, ''),
+        ('base.inegi50_carreteras', 'Carreteras (INEGI 1:50 000)', False, ''),
+        ('base.inegi50_caminos', 'Caminos y brechas (INEGI 1:50 000)', False, ''),
+        ('base.osm_lineas_piloto', 'OpenStreetMap: vías y cauces', False, ''),
+    ]),
+    ('Agua del relieve fino (piloto)', [
+        ('terreno.cuerpos_agua', 'Cuerpos de agua (planos a su nivel en 3D)', True, '"zona" = \'piloto\''),
+        ('terreno.cauces', 'Cauces calculados del relieve (5 m)', True, '"zona" = \'piloto\''),
+        ('base.inegi50_corrientes', 'Corrientes (INEGI 1:50 000)', False, ''),
+        ('terreno.subcuencas', 'Subcuencas de 2 km² o más', False, '"zona" = \'piloto\''),
+    ]),
     ('Población y servicios', [
         ('qgis.localidades', None, True, ''),
         ('qgis.servicios', None, False, ''),
@@ -49,12 +63,12 @@ CAPAS = [
         ('qgis.repda_superficiales', None, False, ''),
         ('qgis.repda_descargas', None, False, ''),
         ('qgis.recarga_focos', None, False, ''),
-        ('qgis.rios', None, True, ''),
+        ('qgis.rios', None, False, ''),
         ('qgis.ordenamientos_agua', None, False, ''),
         ('qgis.acuiferos', None, False, ''),
     ]),
     ('Vías', [
-        ('qgis.red_vial', None, True, ''),
+        ('qgis.red_vial', None, False, ''),
         ('qgis.red_vial_nodos', None, False, ''),
     ]),
     ('Riesgos y geología', [
@@ -146,6 +160,79 @@ def estilo(lyr: QgsVectorLayer, capa: str, grupos_suelo: list[tuple]) -> None:
         q = QColor(colores.get(capa, '#888888'))
         lyr.renderer().setSymbol(QgsFillSymbol.createSimple(
             {'color': f'{q.red()},{q.green()},{q.blue()},35', 'outline_color': q.name(), 'outline_width': '0.4'}))
+    elif capa == 'terreno.calles':
+        from qgis.core import QgsRuleBasedRenderer
+        raiz = QgsRuleBasedRenderer.Rule(None)
+        for etiqueta, expr, color in (
+                ('por revisar: puente, paso a desnivel o escalón en el relieve',
+                 'coalesce("puente", false) OR coalesce("perfil_irregular", false)', '#9e9e9e'),
+                ('menos de 5 %', '"pend_max_pct" < 5', '#1a9641'),
+                ('5 a 10 %', '"pend_max_pct" >= 5 AND "pend_max_pct" < 10', '#a6d96a'),
+                ('10 a 15 %', '"pend_max_pct" >= 10 AND "pend_max_pct" < 15', '#fdae61'),
+                ('15 a 25 %', '"pend_max_pct" >= 15 AND "pend_max_pct" < 25', '#d7191c'),
+                ('25 % o más', '"pend_max_pct" >= 25', '#7b3294')):
+            if not etiqueta.startswith('por revisar'):
+                expr = f'NOT coalesce("puente", false) AND NOT coalesce("perfil_irregular", false) AND {expr}'
+            s = QgsLineSymbol.createSimple({'color': color, 'width': '0.55', 'capstyle': 'round'})
+            raiz.appendChild(QgsRuleBasedRenderer.Rule(s, 0, 0, expr, etiqueta))
+        lyr.setRenderer(QgsRuleBasedRenderer(raiz))
+        lyr.setScaleBasedVisibility(True)
+        lyr.setMinimumScale(150_000)
+    elif capa == 'base.mg_manzanas':
+        lyr.renderer().setSymbol(QgsFillSymbol.createSimple(
+            {'color': '242,232,213,150', 'outline_color': '#b9a88a', 'outline_width': '0.12'}))
+        lyr.setScaleBasedVisibility(True)
+        lyr.setMinimumScale(40_000)
+    elif capa == 'base.mg_servicios_a':
+        from qgis.core import QgsRuleBasedRenderer
+        raiz = QgsRuleBasedRenderer.Rule(None)
+        for etiqueta, expr, color in (
+                ('parques y jardines', 'lower("geografico") LIKE \'%parque%\' OR lower("geografico") LIKE \'%jard%\'', '127,178,90,200'),
+                ('deportivos', 'lower("geografico") LIKE \'%deport%\' OR lower("geografico") LIKE \'%cancha%\'', '166,206,120,200'),
+                ('otros espacios (escuelas, panteones, mercados…)', 'ELSE', '205,196,184,180')):
+            s = QgsFillSymbol.createSimple({'color': color, 'outline_color': '#8c8c8c', 'outline_width': '0.1'})
+            raiz.appendChild(QgsRuleBasedRenderer.Rule(s, 0, 0, '' if expr == 'ELSE' else expr, etiqueta,
+                                                       '', expr == 'ELSE'))
+        lyr.setRenderer(QgsRuleBasedRenderer(raiz))
+        lyr.setScaleBasedVisibility(True)
+        lyr.setMinimumScale(40_000)
+    elif capa == 'base.inegi50_carreteras':
+        lyr.renderer().setSymbol(QgsLineSymbol.createSimple({'color': '#c0392b', 'width': '0.5'}))
+    elif capa == 'base.inegi50_caminos':
+        lyr.renderer().setSymbol(QgsLineSymbol.createSimple({'color': '#8d6e63', 'width': '0.3', 'line_style': 'dash'}))
+    elif capa == 'base.osm_lineas_piloto':
+        lyr.renderer().setSymbol(QgsLineSymbol.createSimple({'color': '#607d8b', 'width': '0.2'}))
+    elif capa == 'terreno.cauces':
+        from qgis.core import QgsRuleBasedRenderer
+        raiz = QgsRuleBasedRenderer.Rule(None)
+        for etiqueta, expr, ancho, estilo in (
+                ('río principal (100 km² o más)', '"clase" = \'río principal\'', '1.1', 'solid'),
+                ('río (10 a 100 km²)', '"clase" = \'río\'', '0.75', 'solid'),
+                ('arroyo (1 a 10 km²)', '"clase" = \'arroyo\'', '0.45', 'solid'),
+                ('escurrimiento (0.1 a 1 km²)', '"clase" = \'escurrimiento\'', '0.2', 'solid')):
+            for urbano in (False, True):
+                s = QgsLineSymbol.createSimple({'color': '#6baed6' if urbano else '#1f78b4', 'width': ancho,
+                                                'line_style': 'dot' if urbano else estilo, 'capstyle': 'round'})
+                raiz.appendChild(QgsRuleBasedRenderer.Rule(
+                    s, 0, 0, f'{expr} AND {"" if urbano else "NOT "}coalesce("urbano", false)',
+                    etiqueta + (' en zona urbana (puede ir entubado)' if urbano else '')))
+        lyr.setRenderer(QgsRuleBasedRenderer(raiz))
+    elif capa == 'base.inegi50_corrientes':
+        from qgis.core import QgsRuleBasedRenderer
+        raiz = QgsRuleBasedRenderer.Rule(None)
+        for etiqueta, expr, estilo in (('perenne', 'lower("condicion") LIKE \'perenne%\'', 'solid'),
+                                       ('intermitente', 'ELSE', 'dash')):
+            s = QgsLineSymbol.createSimple({'color': '#08306b', 'width': '0.35', 'line_style': estilo})
+            raiz.appendChild(QgsRuleBasedRenderer.Rule(s, 0, 0, '' if expr == 'ELSE' else expr, etiqueta, '',
+                                                       expr == 'ELSE'))
+        lyr.setRenderer(QgsRuleBasedRenderer(raiz))
+    elif capa == 'terreno.cuerpos_agua':
+        lyr.renderer().setSymbol(QgsFillSymbol.createSimple(
+            {'color': '76,134,168,220', 'outline_color': '#2c5d7c', 'outline_width': '0.25'}))
+        agua_3d(lyr)
+    elif capa == 'terreno.subcuencas':
+        lyr.renderer().setSymbol(QgsFillSymbol.createSimple(
+            {'style': 'no', 'outline_color': '#6a3d9a', 'outline_width': '0.4', 'outline_style': 'dash'}))
     elif capa == 'terreno.zonas':
         lyr.renderer().setSymbol(QgsFillSymbol.createSimple(
             {'style': 'no', 'outline_color': '#d7191c', 'outline_width': '0.6', 'outline_style': 'dash'}))
@@ -203,6 +290,32 @@ HIPSOMETRIA = [(0.00, '#3e7b4f'), (0.15, '#7da55b'), (0.32, '#c8c27c'), (0.50, '
                (0.85, '#d9cfc4'), (1.00, '#ffffff')]
 
 
+def agua_3d(lyr) -> None:
+    """En las vistas 3D, cada cuerpo de agua como superficie plana a su nivel (nivel_m + 0.3 m), no pegada al relieve."""
+    try:
+        import qgis._3d as q3
+        import qgis.core as qc
+        from qgis.core import Qgis, QgsProperty
+        # según la versión, cada clase vive en qgis._3d o en qgis.core
+        clase = lambda n: getattr(q3, n, None) or getattr(qc, n)
+        QgsAbstract3DSymbol, QgsPhongMaterialSettings = clase('QgsAbstract3DSymbol'), clase('QgsPhongMaterialSettings')
+        QgsPolygon3DSymbol, QgsVectorLayer3DRenderer = clase('QgsPolygon3DSymbol'), clase('QgsVectorLayer3DRenderer')
+        sim = QgsPolygon3DSymbol()
+        sim.setAltitudeClamping(Qgis.AltitudeClamping.Absolute)
+        mat = QgsPhongMaterialSettings()
+        mat.setDiffuse(QColor('#3f7fa6'))
+        mat.setAmbient(QColor('#1d4f6e'))
+        mat.setSpecular(QColor('#ffffff'))
+        mat.setShininess(80)
+        sim.setMaterialSettings(mat)
+        prop = getattr(QgsAbstract3DSymbol, 'Property', None)
+        clave = prop.Height if prop is not None and hasattr(prop, 'Height') else QgsAbstract3DSymbol.PropertyHeight
+        sim.dataDefinedProperties().setProperty(clave, QgsProperty.fromExpression('coalesce("nivel_m", 0) + 0.3'))
+        lyr.setRenderer3D(QgsVectorLayer3DRenderer(sim))
+    except Exception as e:   # sin 3D en esta instalación: queda solo pintada sobre el relieve
+        log(f'  (sin agua plana en 3D: {e})')
+
+
 def capa_raster(nombre_archivo: str, nombre: str):
     """Capa de un GeoTIFF de datos/terreno con su estilo, o None si todavía no existe."""
     from osgeo import gdal
@@ -253,6 +366,32 @@ def capa_raster(nombre_archivo: str, nombre: str):
         except Exception:
             pass
     return lyr
+
+
+def marcadores(proj, con, crs, caja_estado) -> None:
+    """Marcadores espaciales del proyecto (panel Marcadores espaciales, o Ver → Mostrar marcadores): un clic y el
+    mapa va ahí. Las cabeceras se centran en su localidad del ITER con 4 km de lado."""
+    from qgis.core import QgsBookmark
+    bm = proj.bookmarkManager()
+    bm.clear()
+
+    def poner(nombre, x0, y0, x1, y1):
+        b = QgsBookmark()
+        b.setName(nombre)
+        b.setGroup('Relieve de Hidalgo')
+        b.setExtent(QgsReferencedRectangle(QgsRectangle(x0, y0, x1, y1), crs))
+        bm.addBookmark(b)
+
+    poner('1. Todo Hidalgo', *caja_estado)
+    z = consulta(con, """select ST_XMin(b), ST_YMin(b), ST_XMax(b), ST_YMax(b)
+                         from (select ST_Envelope(geom) b from terreno.zonas where zona = 'piloto') x""")
+    if z:
+        poner('2. Zona piloto (relieve de 1.5 m)', *z[0])
+    for i, (nombre, x, y) in enumerate(consulta(con, """
+            select nombre, ST_X(geom), ST_Y(geom) from qgis.localidades
+            where cvegeo in ('130480001', '130390001', '130380001', '130510001')
+            order by array_position(array['130480001', '130390001', '130380001', '130510001'], cvegeo::text)"""), 3):
+        poner(f'{i}. {nombre}', x - 2000, y - 2000, x + 2000, y + 2000)
 
 
 def ficha(lyr, m: dict) -> None:
@@ -337,6 +476,7 @@ def main() -> int:
             proj.elevationProperties().setTerrainProvider(prov)
             log(f'  terreno 3D del proyecto: {terreno_3d.name()}')
         proj.viewSettings().setDefaultViewExtent(QgsReferencedRectangle(QgsRectangle(xmin, ymin, xmax, ymax), crs))
+        marcadores(proj, con, crs, (xmin, ymin, xmax, ymax))
         DESTINO.parent.mkdir(parents=True, exist_ok=True)
         if DESTINO.exists():
             shutil.copy2(DESTINO, DESTINO.with_name(DESTINO.name + '.bak'))

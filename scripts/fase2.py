@@ -211,7 +211,346 @@ def paso_osm() -> None:
         con.execute(sql.SQL('comment on table {} is {}').format(sql.Identifier('base', tabla), sql.Literal(texto)))
 
 
-PASOS = {'mg': paso_mg, 'topo50': paso_topo50, 'osm': paso_osm}
+# ── Red de drenaje calculada del relieve fino (GRASS) ───────────────────────────────────────────────────────────────
+
+TERRENO = DATOS / 'terreno'
+HIDRO = DATOS / 'terreno' / 'hidro'
+CELDA_HIDRO = 5.0          # m: el relieve de 1.5 m se promedia a 5 m (49 Mpx en el piloto; a 1.5 m no cabe en memoria)
+CAUCE_KM2 = 0.1            # área drenada desde la que empieza un cauce
+SUBCUENCA_KM2 = 2.0        # tamaño mínimo de subcuenca
+CLASES = [(100, 'río principal'), (10, 'río'), (1, 'arroyo'), (0, 'escurrimiento')]   # por km² drenados
+QGIS_PROCESS = Path(r'C:\Program Files\QGIS 3.44.15\bin\qgis_process-qgis-ltr.bat')
+
+
+def qgis_process(algoritmo: str, entradas: dict) -> dict:
+    """Corre un algoritmo de Processing (p. ej. de GRASS) con qgis_process; las entradas van en JSON por stdin."""
+    import json
+    import os
+    import subprocess
+    env = {**os.environ, 'QT_QPA_PLATFORM': 'offscreen'}
+    t0 = time.time()
+    r = subprocess.run([str(QGIS_PROCESS), '--json', 'run', algoritmo, '-'], input=json.dumps({'inputs': entradas}),
+                       capture_output=True, text=True, env=env)
+    if r.returncode:
+        raise RuntimeError(f'{algoritmo}: {r.stderr[-1500:] or r.stdout[-1500:]}')
+    salida = json.loads(r.stdout[r.stdout.index('{'):])
+    log(f'  {algoritmo} ({time.time() - t0:.0f} s)')
+    return salida.get('results', {})
+
+
+def leer(ruta: Path):
+    from osgeo import gdal
+    ds = gdal.Open(str(ruta))
+    a = ds.GetRasterBand(1).ReadAsArray()
+    gt = ds.GetGeoTransform()
+    ds = None
+    return a, gt
+
+
+def paso_drenaje() -> None:
+    import numpy as np
+    from osgeo import gdal, ogr
+    gdal.UseExceptions()
+    zona = zona_arg()
+    con = conectar()
+    correr_sql(con, SQL / 'fase2' / '03_hidro.sql')
+    HIDRO.mkdir(parents=True, exist_ok=True)
+    fino = TERRENO / f'relieve_{zona}_1p5m.tif'
+    dem5 = HIDRO / f'relieve_{zona}_5m.tif'
+    if not dem5.exists():
+        gdal.Warp(str(dem5), str(fino), xRes=CELDA_HIDRO, yRes=CELDA_HIDRO, targetAlignedPixels=True,
+                  resampleAlg='average', srcNodata=-9999, dstNodata=-9999,
+                  creationOptions=['TILED=YES', 'COMPRESS=DEFLATE', 'PREDICTOR=3'])
+    celda_m2 = CELDA_HIDRO ** 2
+    acc, cuencas = HIDRO / f'acumulacion_{zona}.tif', HIDRO / f'subcuencas_{zona}.tif'
+    if not acc.exists():
+        # r.watershed busca el camino de menor costo y atraviesa las depresiones sin rellenarlas; con flujo múltiple
+        # (convergencia 5). Valores negativos = puede entrar agua de fuera del recuadro (cuenca incompleta).
+        qgis_process('grass:r.watershed', {
+            'elevation': str(dem5), 'threshold': int(SUBCUENCA_KM2 * 1e6 / celda_m2), 'convergence': 5, '-b': True,
+            'accumulation': str(acc), 'basin': str(cuencas), 'GRASS_REGION_CELLSIZE_PARAMETER': CELDA_HIDRO})
+    vec = HIDRO / f'cauces_{zona}.gpkg'
+    if not vec.exists():
+        umbral = int(CAUCE_KM2 * 1e6 / celda_m2)
+        qgis_process('grass:r.stream.extract', {
+            'elevation': str(dem5), 'threshold': umbral, 'd8cut': umbral, 'stream_length': 20, 'memory': 4000,
+            'stream_vector': str(vec), 'GRASS_OUTPUT_TYPE_PARAMETER': 2, 'GRASS_REGION_CELLSIZE_PARAMETER': CELDA_HIDRO})
+
+    # atributos de cada tramo: área drenada en su extremo de aguas abajo, cuenca incompleta, alturas y pendiente
+    a, gt = leer(acc)
+    z, _ = leer(dem5)
+    h, w = a.shape
+
+    def valor(arr, x, y):
+        c, f = int((x - gt[0]) / gt[1]), int((gt[3] - y) / -gt[5])
+        return arr[min(max(f, 0), h - 1), min(max(c, 0), w - 1)]
+
+    ds = ogr.Open(str(vec))
+    capa = ds.GetLayer(0)
+    filas = []
+    for f in capa:
+        g = f.GetGeometryRef()
+        partes = [g.GetGeometryRef(i) for i in range(g.GetGeometryCount())] if g.GetGeometryCount() else [g]
+        pts = [p for parte in partes for p in parte.GetPoints()]
+        if len(pts) < 2:
+            continue
+        a0, a1 = valor(a, *pts[0][:2]), valor(a, *pts[-1][:2])
+        abajo, arriba = (pts[-1], pts[0]) if abs(a1) >= abs(a0) else (pts[0], pts[-1])
+        aa = a1 if abs(a1) >= abs(a0) else a0
+        km2 = abs(float(aa)) * celda_m2 / 1e6
+        z_arriba, z_abajo = float(valor(z, *arriba[:2])), float(valor(z, *abajo[:2]))
+        largo = g.Length()
+        clase = next(c for lim, c in CLASES if km2 >= lim)
+        tipo = f.GetField('stream_type') if f.GetFieldIndex('stream_type') >= 0 else None
+        red = f.GetField('network') if f.GetFieldIndex('network') >= 0 else None
+        filas.append((zona, tipo, red, round(km2, 4), bool(aa < 0), clase, round(z_arriba, 2), round(z_abajo, 2),
+                      round(largo, 1), round(100 * (z_arriba - z_abajo) / largo, 2) if largo > 0 else None,
+                      g.ExportToWkb()))
+    ds = None
+    with con.transaction():
+        con.execute('delete from terreno.cauces where zona = %s', (zona,))
+        with con.cursor() as cur:
+            cur.executemany("""insert into terreno.cauces (zona, tipo, red, area_km2, cuenca_incompleta, clase, z_arriba,
+                                 z_abajo, largo_m, pendiente_pct, geom)
+                               values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                                       ST_Multi(ST_SetSRID(ST_GeomFromWKB(%s), 6369)))""", filas)
+        con.execute("""update terreno.cauces c set urbano = exists (
+                         select 1 from base.mg_localidades l where l.ambito = 'Urbana' and ST_Intersects(l.geom, c.geom))
+                       where zona = %s""", (zona,))
+    con.execute('analyze terreno.cauces')   # sin estadísticas, el planeador recorre la tabla en cada búsqueda
+    log(f'cauces {zona}: {len(filas):,} tramos')
+
+    # subcuencas: del ráster de cuencas a polígonos; las que tocan la orilla del recuadro quedan como incompletas
+    tmp = HIDRO / f'subcuencas_{zona}.gpkg'
+    if tmp.exists():
+        tmp.unlink()
+    src = gdal.Open(str(cuencas))
+    drv = ogr.GetDriverByName('GPKG').CreateDataSource(str(tmp))
+    lyr = drv.CreateLayer('subcuencas', srs=src.GetSpatialRef(), geom_type=ogr.wkbPolygon)
+    lyr.CreateField(ogr.FieldDefn('cuenca', ogr.OFTInteger))
+    gdal.Polygonize(src.GetRasterBand(1), src.GetRasterBand(1).GetMaskBand(), lyr, 0)
+    drv = None
+    src = None
+    cargar_vector(tmp, 'terreno', f'subcuencas_carga_{zona}')
+    with con.transaction():
+        con.execute('delete from terreno.subcuencas where zona = %s', (zona,))
+        con.execute(f"""
+            insert into terreno.subcuencas (zona, cuenca, area_km2, incompleta, geom)
+            select %s, s.cuenca, ST_Area(ST_Transform(ST_Union(s.geom), 4326)::geography) / 1e6,
+                   ST_Intersects(ST_Union(s.geom), ST_Boundary((select ST_Envelope(ST_Collect(geom))
+                                                                 from terreno.subcuencas_carga_{zona}))),
+                   ST_Multi(ST_Union(s.geom))
+            from terreno.subcuencas_carga_{zona} s
+            where s.cuenca > 0
+            group by s.cuenca""", (zona,))
+        con.execute(f'drop table terreno.subcuencas_carga_{zona}')
+    r = consulta(con, """select count(*), count(*) filter (where not incompleta), round(sum(area_km2)::numeric)
+                         from terreno.subcuencas where zona = %s""", (zona,))[0]
+    log(f'subcuencas {zona}: {r[0]} ({r[1]} completas), {r[2]} km²')
+    for clase, n, km, inc, urb in consulta(con, """
+            select clase, count(*), round(sum(largo_m)::numeric / 1000, 1),
+                   count(*) filter (where cuenca_incompleta), count(*) filter (where urbano)
+            from terreno.cauces where zona = %s group by clase order by min(area_km2) desc""", (zona,)):
+        log(f'  {clase}: {n:,} tramos, {km} km ({inc} con cuenca incompleta, {urb} en zona urbana)')
+
+
+# ── Perfiles sobre el relieve de 1.5 m ──────────────────────────────────────────────────────────────────────────────
+
+class Relieve:
+    """Lee alturas del relieve fino por ventanas (no cabe entero en memoria) con interpolación bilineal."""
+
+    def __init__(self, ruta: Path):
+        from osgeo import gdal
+        self.ds = gdal.Open(str(ruta))
+        self.b = self.ds.GetRasterBand(1)
+        self.gt = self.ds.GetGeoTransform()
+        self.w, self.h = self.ds.RasterXSize, self.ds.RasterYSize
+
+    def alturas(self, xs, ys):
+        import numpy as np
+        cx = (np.asarray(xs) - self.gt[0]) / self.gt[1] - 0.5
+        cy = (self.gt[3] - np.asarray(ys)) / -self.gt[5] - 0.5
+        x0, y0 = max(int(np.floor(cx.min())), 0), max(int(np.floor(cy.min())), 0)
+        x1, y1 = min(int(np.floor(cx.max())) + 2, self.w), min(int(np.floor(cy.max())) + 2, self.h)
+        if x1 <= x0 or y1 <= y0:
+            return np.full(len(cx), np.nan)
+        v = self.b.ReadAsArray(x0, y0, x1 - x0, y1 - y0).astype(np.float64)
+        v[v <= -1000] = np.nan
+        fx, fy = np.clip(cx - x0, 0, x1 - x0 - 1), np.clip(cy - y0, 0, y1 - y0 - 1)
+        i0, j0 = np.floor(fy).astype(int), np.floor(fx).astype(int)
+        i1, j1 = np.minimum(i0 + 1, v.shape[0] - 1), np.minimum(j0 + 1, v.shape[1] - 1)
+        dy, dx = fy - i0, fx - j0
+        return (v[i0, j0] * (1 - dx) * (1 - dy) + v[i0, j1] * dx * (1 - dy)
+                + v[i1, j0] * (1 - dx) * dy + v[i1, j1] * dx * dy)
+
+
+def muestrear(linea, paso: float):
+    """Puntos cada `paso` metros sobre una línea de shapely (incluye los dos extremos)."""
+    import numpy as np
+    import shapely
+    d = np.append(np.arange(0, linea.length, paso), linea.length)
+    p = shapely.line_interpolate_point(linea, d)
+    return d, shapely.get_x(p), shapely.get_y(p)
+
+
+def paso_agua() -> None:
+    import numpy as np
+    import shapely
+    zona = zona_arg()
+    con = conectar()
+    correr_sql(con, SQL / 'fase2' / '04_agua_calles.sql')
+    with con.transaction():
+        con.execute('delete from terreno.cuerpos_agua where zona = %s', (zona,))
+        con.execute(f"""
+            insert into terreno.cuerpos_agua (zona, fuente, nombre, tipo, condicion, area_ha, geom)
+            select z.zona, 'INEGI 1:50 000', c.nombre, c.tipo, c.condicion,
+                   ST_Area(ST_Transform(c.geom, 4326)::geography) / 1e4, c.geom
+            from base.inegi50_cuerpos_agua c join terreno.zonas z on z.zona = %s and ST_Intersects(c.geom, z.geom)
+            union all
+            select z.zona, 'OpenStreetMap', o.name, coalesce(o.water, o.reservoir_type, o."natural", o.landuse),
+                   case when o.intermittent = 'yes' then 'Intermitente' end,
+                   ST_Area(ST_Transform(o.geom, 4326)::geography) / 1e4, ST_Multi(o.geom)
+            from base.osm_poligonos_{zona} o join terreno.zonas z on z.zona = %s and ST_Intersects(o.geom, z.geom)
+            where o."natural" = 'water' or o.landuse = 'reservoir' or o.water is not null""", (zona, zona))
+    # nivel del agua: la altura en la orilla (cada 3 m sobre el anillo exterior)
+    rel = Relieve(TERRENO / f'relieve_{zona}_1p5m.tif')
+    filas = []
+    for id_, wkb in consulta(con, 'select id, ST_AsBinary(ST_ExteriorRing((ST_Dump(geom)).geom)) from terreno.cuerpos_agua '
+                                  'where zona = %s', (zona,)):
+        anillo = shapely.from_wkb(bytes(wkb))
+        _, xs, ys = muestrear(anillo, 3.0)
+        z = rel.alturas(xs, ys)
+        z = z[np.isfinite(z)]
+        if z.size:
+            filas.append((float(np.median(z)), float(np.percentile(z, 90) - np.percentile(z, 10)), id_))
+    with con.transaction(), con.cursor() as cur:
+        cur.executemany('update terreno.cuerpos_agua set nivel_m = %s, nivel_rango_m = %s where id = %s', filas)
+    r = consulta(con, """select fuente, count(*), round(sum(area_ha)::numeric, 1), count(nivel_m)
+                         from terreno.cuerpos_agua where zona = %s group by 1""", (zona,))
+    for fuente, n, ha, con_nivel in r:
+        log(f'cuerpos de agua {zona} ({fuente}): {n}, {ha} ha, {con_nivel} con nivel')
+
+    # control: qué tanto caen los ríos de INEGI y de OSM sobre los cauces calculados
+    con.execute('analyze terreno.cauces')
+    with con.transaction():
+        con.execute('delete from terreno.control_cauces where zona = %s', (zona,))
+        con.execute(f"""
+            with z as (select geom from terreno.zonas where zona = %(z)s),
+            ref as (
+              select 'INEGI 1:50 000' as referencia, lower(coalesce(c.condicion, 'sin dato')) as grupo,
+                     ST_Intersection(c.geom, z.geom) as g
+              from base.inegi50_corrientes c, z where ST_Intersects(c.geom, z.geom)
+              union all
+              select 'OpenStreetMap', coalesce(o.waterway, 'cauce'), ST_Intersection(o.geom, z.geom)
+              from base.osm_lineas_{zona} o, z where o.waterway is not null and ST_Intersects(o.geom, z.geom)),
+            pts as (
+              select r.referencia, r.grupo, (ST_DumpPoints(ST_Segmentize(r.g, 10))).geom as p from ref r
+              where not ST_IsEmpty(r.g)),
+            d as (
+              select p.referencia, p.grupo,
+                     (select ST_Distance(p.p, k.geom) from terreno.cauces k where k.zona = %(z)s
+                      order by k.geom <-> p.p limit 1) as dist
+              from pts p)
+            insert into terreno.control_cauces
+            select %(z)s, referencia, coalesce(grupo, 'todos'), count(*), count(*) * 10 / 1000.0,
+                   percentile_cont(0.5) within group (order by dist),
+                   100.0 * avg((dist <= 20)::int), 100.0 * avg((dist <= 50)::int)
+            from d group by referencia, rollup(grupo)""", {'z': zona})
+    from fase0 import tabla
+    tabla([tuple(r) for r in consulta(con, """select referencia, grupo, km, round(mediana_m::numeric, 1),
+                                               round(pct_20m::numeric), round(pct_50m::numeric)
+                                              from terreno.control_cauces where zona = %s order by 1, 3 desc""", (zona,))],
+          ('referencia', 'grupo', 'km', 'distancia mediana m', '% a ≤ 20 m', '% a ≤ 50 m'))
+
+
+def paso_calles() -> None:
+    import numpy as np
+    import shapely
+    zona = zona_arg()
+    con = conectar()
+    correr_sql(con, SQL / 'fase2' / '04_agua_calles.sql')
+    VENTANA_M, PASO_M = 20.0, 1.5
+    rel = Relieve(TERRENO / f'relieve_{zona}_1p5m.tif')
+    ejes = consulta(con, """select e.cvegeo, e.nomvial, e.tipovial, e.sentido, e.ambito, ST_AsBinary(e.geom)
+                            from base.mg_ejes e join terreno.zonas z on z.zona = %s and ST_Intersects(e.geom, z.geom)""",
+                    (zona,))
+    log(f'calles de {zona}: {len(ejes):,} segmentos del Marco Geoestadístico')
+    filas, t0 = [], time.time()
+
+    def pend_max_en(d, z, ventana_m):
+        """La mayor pendiente (%) en `ventana_m` metros seguidos; en todo el tramo si es más corto."""
+        k = int(round(ventana_m / PASO_M))
+        if len(z) > k:
+            return float(np.max(np.abs(z[k:] - z[:-k]) / (d[k:] - d[:-k])) * 100)
+        return abs(float(z[-1] - z[0])) / max(float(d[-1]), 1e-6) * 100
+
+    for cvegeo, nombre, tipo, sentido, ambito, wkb in ejes:
+        g = shapely.from_wkb(bytes(wkb))
+        linea = shapely.line_merge(g) if g.geom_type == 'MultiLineString' else g
+        if linea.geom_type != 'LineString' or linea.length < 1:
+            continue
+        d, xs, ys = muestrear(linea, PASO_M)
+        z = rel.alturas(xs, ys)
+        if not np.isfinite(z).all():
+            continue
+        dz = np.diff(z)
+        largo = float(linea.length)
+        p20, p60 = pend_max_en(d, z, VENTANA_M), pend_max_en(d, z, 60.0)
+        # Una calle empinada de verdad lo es también en 60 m; un escalón corto (puente que el relieve no tiene,
+        # paso a desnivel, muro o error del relieve) da mucha pendiente en 20 m y poca en 60 m.
+        irregular = largo >= 60 and p20 > 2 * p60 + 10
+        filas.append((zona, cvegeo, nombre, tipo, sentido, ambito, round(largo, 1), round(float(z[0]), 2),
+                      round(float(z[-1]), 2), round(abs(float(z[-1] - z[0])), 2),
+                      round(abs(float(z[-1] - z[0])) / largo * 100, 2), round(p20, 2), round(p60, 2), irregular,
+                      round(float(dz[dz > 0].sum()), 2), round(float(-dz[dz < 0].sum()), 2), bytes(wkb)))
+    log(f'  perfiles medidos: {len(filas):,} ({time.time() - t0:.0f} s)')
+    with con.transaction():
+        con.execute('delete from terreno.calles where zona = %s', (zona,))
+        with con.cursor() as cur:
+            cur.executemany("""insert into terreno.calles (zona, fuente, cvegeo, nombre, tipo, sentido, ambito, largo_m,
+                                 z_ini, z_fin, desnivel_m, pend_media_pct, pend_max_pct, pend_max_60m_pct,
+                                 perfil_irregular, subida_m, bajada_m, geom)
+                               values (%s, 'INEGI Marco Geoestadístico 2025', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                                       %s, %s, %s, %s, %s, ST_Multi(ST_SetSRID(ST_GeomFromWKB(%s), 6369)))""", filas)
+        con.execute('analyze terreno.calles')
+        # tipo y superficie de OSM: el tramo de vía que más se le encima a ≤ 10 m; puente si OSM marca uno encima
+        con.execute(f"""
+            update terreno.calles c set osm_tipo = o.highway, osm_superficie = o.surface
+            from (
+              select distinct on (c2.id) c2.id, o2.highway, o2.surface
+              from terreno.calles c2
+              join base.osm_lineas_{zona} o2 on o2.highway is not null and ST_DWithin(o2.geom, c2.geom, 10)
+              where c2.zona = %(z)s
+              order by c2.id, ST_Length(ST_Intersection(o2.geom, ST_Buffer(c2.geom, 10))) desc) o
+            where c.id = o.id""", {'z': zona})
+        # puente o paso a desnivel: una vía de OSM con bridge o con nivel (layer) distinto de 0 a ≤ 15 m, que
+        # acompañe a la calle al menos 10 m (en los distribuidores, el eje de INEGI y los de OSM no coinciden)
+        con.execute(f"""
+            update terreno.calles c set puente = exists (
+              select 1 from base.osm_lineas_{zona} o
+              where o.highway is not null
+                and ((o.bridge is not null and o.bridge <> 'no') or coalesce(o.layer, '0') not in ('0', ''))
+                and ST_DWithin(o.geom, c.geom, 15)
+                and ST_Length(ST_Intersection(o.geom, ST_Buffer(c.geom, 15))) > 10)
+            where c.zona = %(z)s""", {'z': zona})
+    from fase0 import tabla
+    tabla([tuple(r) for r in consulta(con, """
+        select case when pend_max_pct < 5 then 'a. menos de 5 %%' when pend_max_pct < 10 then 'b. 5 a 10 %%'
+                    when pend_max_pct < 15 then 'c. 10 a 15 %%' when pend_max_pct < 25 then 'd. 15 a 25 %%'
+                    else 'e. 25 %% o más' end as pendiente_max,
+               count(*), round(sum(largo_m)::numeric / 1000, 1) as km
+        from terreno.calles where zona = %s and not coalesce(puente, false) and not perfil_irregular
+        group by 1 order by 1""", (zona,))],
+          ('pendiente máxima (20 m)', 'segmentos', 'km'))
+    r = consulta(con, """select count(*) filter (where puente), count(*) filter (where perfil_irregular and not puente),
+                                count(osm_superficie), count(*)
+                         from terreno.calles where zona = %s""", (zona,))[0]
+    log(f'  {r[0]} junto a puentes o pasos a desnivel y {r[1]} con perfil irregular (pendiente por revisar); '
+        f'{r[2]:,} de {r[3]:,} con superficie de OSM')
+
+
+PASOS = {'mg': paso_mg, 'topo50': paso_topo50, 'osm': paso_osm, 'drenaje': paso_drenaje, 'agua': paso_agua,
+         'calles': paso_calles}
 
 
 def main() -> int:

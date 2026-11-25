@@ -20,6 +20,8 @@ correr scripts\fase1.py hojas        :: hojas de 1.5 m del piloto (2.4 GB; --zon
 correr scripts\fase1.py relieve      :: mosaico, fusión con el CEM, sombreado y pendiente
 correr scripts\fase1.py calidad      :: control de calidad de cada hoja (terreno.hojas)
 correr scripts\fase1.py registrar    :: rásters en PostGIS y terreno.altitud(punto) por SQL
+correr scripts\fase2.py mg topo50 osm       :: calles y manzanas de INEGI 2025, cartas 1:50 000 y OpenStreetMap
+correr scripts\fase2.py drenaje agua calles :: cauces y subcuencas (GRASS), cuerpos de agua y pendiente de calles
 correr scripts\proyecto_qgis.py --forzar   :: rehace qgis\RelieveHidalgo.qgz con el relieve y el terreno 3D
 correr scripts\vista_previa.py       :: PNG del proyecto en datos\vistas, sin abrir QGIS
 correr scripts\vista_3d.py pachuca 522000 2223000 6000 65 200   :: vista 3D a PNG
@@ -74,13 +76,30 @@ decidir sobre un predio. Cada análisis reporta el mayor `detalle_m` de lo que u
   descargables. El control es propio (`terreno.hojas`), más un cotejo con la altitud del ITER 2020: en el piloto
   difiere 5.4 m (mediana), lo esperable para un dato aproximado.
 
+## Agua y calles (fase 2, piloto)
+
+- **Calles oficiales:** ejes de vialidad del Marco Geoestadístico 2025 de INEGI (266 468 en Hidalgo, con nombre, tipo
+  y sentido). Del zip nacional de 2.7 GB se baja solo el de Hidalgo (106 MB). INEGI mezcla codificaciones de texto
+  sin declararlas; se detectan por archivo.
+- **Pendiente de cada calle** (`terreno.calles`, 42 684 segmentos en el piloto): perfil cada 1.5 m sobre el relieve
+  fino, con la pendiente máxima en 20 y en 60 m. El relieve no tiene puentes: los tramos junto a un puente o paso a
+  desnivel de OSM (1 138) y los de perfil con un escalón corto (70) quedan «por revisar».
+- **Cauces calculados** del relieve a 5 m con GRASS (`terreno.cauces`: 4 883 tramos, ≈ 3 030 km, desde 0.1 km²
+  drenados) y 628 subcuencas de 2 km² o más. Coinciden con los ríos de las cartas 1:50 000 de INEGI: distancia
+  mediana 8.5 m; 74 % a ≤ 20 m y 84 % a ≤ 50 m (perennes: 82 % y 92 %). Detalle en `terreno.control_cauces`.
+- **Cuerpos de agua** de INEGI (137) y OSM (64) con su nivel (mediana de la altura en la orilla): en 3D se dibujan
+  planos a ese nivel.
+- El proyecto trae **marcadores** (Todo Hidalgo, zona piloto, Pachuca, Mineral del Monte, Mineral del Chico,
+  Pachuquilla): panel «Marcadores espaciales».
+
 ## Fases
 
 0. **Base** (lista): PostGIS, límites oficiales, capas con geometría, catálogo de capas y proyecto de QGIS.
 1. **Relieve**: CEM 4.0 de INEGI (15 m, 2025) para todo el estado y modelos de 1.5 m en el piloto (Pachuca, Mineral
    de la Reforma, Mineral del Monte y Mineral del Chico). Mosaico con transición de 150 m hacia el CEM, control de
    calidad de cada hoja y terreno 3D del proyecto.
-2. **Agua y calles**: ríos y cuencas recalculados del relieve fino, cuerpos de agua, calles y manzanas de INEGI, OSM.
+2. **Agua y calles** (lista en el piloto): cauces y subcuencas del relieve fino, cuerpos de agua con su nivel, calles
+   y manzanas de INEGI 2025 con la pendiente de cada calle, OpenStreetMap.
 3. **Edificios y árboles**: altura medida (superficie − terreno) de cada edificio y árboles uno por uno.
 4. **Análisis**: reforestación, aptitud para construir, trazos de caminos con cortes y rellenos.
 
@@ -91,11 +110,12 @@ correr.bat               lanza un script con el Python de QGIS
 scripts/comun.py         configuración, conexión, descargas, carga con GDAL, servicio de PostgreSQL
 scripts/fase0.py         fase 0 completa con validación
 scripts/fase1.py         fase 1 por pasos: cem, hojas, relieve, calidad, registrar
+scripts/fase2.py         fase 2 por pasos: mg, topo50, osm, drenaje, agua, calles
 scripts/inegi.py         catálogo de INEGI, zips remotos por rangos y descargas en paralelo
 scripts/proyecto_qgis.py arma el proyecto de QGIS
 scripts/vista_previa.py  renderiza el proyecto a PNG
 scripts/vista_3d.py      renderiza una vista 3D a PNG
-sql/fase0/, sql/fase1/   SQL de cada fase, en orden
+sql/fase0/ … sql/fase2/  SQL de cada fase, en orden
 qgis/                    proyecto de QGIS
 datos/                   descargas y productos (no se versiona)
 ```
