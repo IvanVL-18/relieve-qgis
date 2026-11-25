@@ -13,3 +13,6 @@ __pycache__/
 *.qgs~
 *.aux.xml
 .qgis-cache/
+
+# Memoria del proyecto para Claude (no se versiona, como en el proyecto web)
+CLAUDE.md
