@@ -99,19 +99,33 @@ def pg_gdal() -> str:
             f"user={CFG['DB_USERNAME']} password={CFG['DB_PASSWORD']}")
 
 
+def codificacion_dbf(datos: bytes) -> str:
+    """INEGI mezcla codificaciones sin declararlas (en el Marco Geoestadístico 2025, 13e viene en UTF-8 y 13l en
+    Latin-1): si el texto del .dbf se lee como UTF-8 se queda así; si no, es CP1252."""
+    try:
+        datos.decode('utf-8')
+        return 'UTF-8'
+    except UnicodeDecodeError:
+        return 'CP1252'
+
+
 def cargar_vector(origen: Path, esquema: str, tabla: str, *, srs_origen: str | None = None,
-                  caja: tuple[float, float, float, float] | None = None, tipo: str = 'PROMOTE_TO_MULTI') -> None:
+                  caja: tuple[float, float, float, float] | None = None, tipo: str = 'PROMOTE_TO_MULTI',
+                  codificacion: str | None = None) -> None:
     """Carga un archivo vectorial a PostGIS reproyectado a EPSG:6369, con geometrías válidas e índice espacial.
 
     srs_origen: para archivos cuyo sistema no se lee bien (el GeoJSON de INEGI declara EPSG:6365 dentro de cada
-    geometría, donde GDAL no lo busca). caja: (oeste, sur, este, norte) en el sistema de origen.
+    geometría, donde GDAL no lo busca). caja: (oeste, sur, este, norte) en el sistema de origen. codificacion: la del
+    texto de un shapefile que no la declara (SHAPE_ENCODING).
     """
     from osgeo import gdal
     gdal.UseExceptions()
+    gdal.SetConfigOption('SHAPE_ENCODING', codificacion)
     t0 = time.time()
     opciones = gdal.VectorTranslateOptions(
         options=['-makevalid', '-lco', f'SCHEMA={esquema}', '-lco', 'GEOMETRY_NAME=geom', '-lco', 'FID=gid',
-                 '-lco', 'SPATIAL_INDEX=GIST', '-lco', 'LAUNDER=YES', '-lco', 'PRECISION=NO'],
+                 '-lco', 'SPATIAL_INDEX=GIST', '-lco', 'LAUNDER=YES', '-lco', 'PRECISION=NO',
+                 '-lco', 'OVERWRITE=YES'],   # repetible aunque una corrida anterior haya dejado la tabla
         format='PostgreSQL', accessMode='overwrite', layerName=tabla, srcSRS=srs_origen, dstSRS=f'EPSG:{SRID}',
         reproject=True, geometryType=tipo, spatFilter=caja)
     ds = gdal.VectorTranslate(pg_gdal(), str(origen), options=opciones)
@@ -119,6 +133,7 @@ def cargar_vector(origen: Path, esquema: str, tabla: str, *, srs_origen: str | N
         raise RuntimeError(f'No se pudo cargar {origen}')
     n = ds.GetLayerByName(f'{esquema}.{tabla}').GetFeatureCount()
     ds = None
+    gdal.SetConfigOption('SHAPE_ENCODING', None)
     log(f'{esquema}.{tabla}: {n} elementos de {Path(origen).name} ({time.time() - t0:.1f} s)')
 
 
